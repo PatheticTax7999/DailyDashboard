@@ -38,7 +38,12 @@ let chartInstances = {};
 
 let state = {
   todayGoals: [], tomorrowGoals: [], lastDate: null,
-  routines: [], exerciseHistory: {}
+  routines: [], exerciseHistory: {},
+  supplements: [],        // { id, name, dosage, times: ['morning'|'afternoon'|'evening'|'night'] }
+  suppChecks: {},         // { 'YYYY-MM-DD': { suppId_time: true } }
+  waterGoal: 2000,        // ml
+  waterUnit: 'ml',        // ml | oz | glass | bottle
+  waterLog: {}            // { 'YYYY-MM-DD': number_of_units_consumed }
 };
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
@@ -61,7 +66,12 @@ async function saveToFirestore() {
       lastDate: state.lastDate,
       routines: state.routines,
       exerciseHistory: state.exerciseHistory,
-      useLb
+      useLb,
+      supplements: state.supplements,
+      suppChecks: state.suppChecks,
+      waterGoal: state.waterGoal,
+      waterUnit: state.waterUnit,
+      waterLog: state.waterLog
     });
   } catch(e) { console.error("Save error",e); }
 }
@@ -86,6 +96,11 @@ function subscribeToFirestore() {
       state.routines         = d.routines         || [];
       state.exerciseHistory  = d.exerciseHistory  || {};
       useLb = d.useLb || false;
+      state.supplements = d.supplements || [];
+      state.suppChecks  = d.suppChecks  || {};
+      state.waterGoal   = d.waterGoal   ?? 2000;
+      state.waterUnit   = d.waterUnit   || 'ml';
+      state.waterLog    = d.waterLog    || {};
     } else {
       state.lastDate = new Date().toDateString();
       saveToFirestore();
@@ -129,7 +144,8 @@ window.switchTab = (tab) => {
 };
 function renderCurrentTab() {
   if (currentTab === "daily") renderDaily();
-  else renderFitness();
+  else if (currentTab === "fitness") renderFitness();
+  else if (currentTab === "health") renderHealth();
 }
 
 // ─── CLOCK TICK ──────────────────────────────────────────────────────────────
@@ -138,6 +154,9 @@ setInterval(() => {
     const tw = document.getElementById("time-text");
     const tp = document.getElementById("time-pct");
     if (tw) { tw.textContent = getTime(); const p=getDayPct(); tp.textContent=`${Math.round(p*100)}% of day`; updateWheel(p); }
+  }
+  if (currentTab === "health") {
+    updateSuppUrgency();
   }
   if (activeWorkout) {
     const el = document.getElementById("workout-timer");
@@ -575,6 +594,274 @@ window.finishWorkout = () => {
 
 // expose renderFitness globally for finish button
 window.renderFitness = renderFitness;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HEALTH PAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Time windows: [label, startHour, endHour, icon, urgencyHour]
+const TIME_SLOTS = [
+  { key:"morning",   label:"Morning",   icon:"🌅", start:6,  end:12, urgency:11 },
+  { key:"afternoon", label:"Afternoon", icon:"☀️",  start:12, end:17, urgency:16 },
+  { key:"evening",   label:"Evening",   icon:"🌆", start:17, end:21, urgency:20 },
+  { key:"night",     label:"Night",     icon:"🌙", start:21, end:24, urgency:23 },
+];
+
+const WATER_UNITS = {
+  ml:     { label:"ml",          mlPer:1,    icon:"💧", display: v=>`${v} ml` },
+  oz:     { label:"fl oz",       mlPer:29.5, icon:"💧", display: v=>`${(v*29.5).toFixed(0)} ml` },
+  glass:  { label:"Glass (250ml)",mlPer:250, icon:"🥛", display: v=>`${v*250} ml` },
+  bottle: { label:"1L Bottle",   mlPer:1000, icon:"🍶", display: v=>`${v}L` },
+};
+
+const todayKey = () => new Date().toISOString().slice(0,10);
+
+function getSuppUrgency(slot) {
+  const h = new Date().getHours();
+  if (h < slot.start) return "upcoming";
+  if (h >= slot.end)  return "past";
+  if (h >= slot.urgency) return "urgent";
+  return "active";
+}
+
+function isSuppDone(suppId, slotKey) {
+  const checks = state.suppChecks[todayKey()] || {};
+  return !!checks[`${suppId}_${slotKey}`];
+}
+
+function toggleSuppCheck(suppId, slotKey) {
+  const dk = todayKey();
+  if (!state.suppChecks[dk]) state.suppChecks[dk] = {};
+  const k = `${suppId}_${slotKey}`;
+  state.suppChecks[dk][k] = !state.suppChecks[dk][k];
+  saveToFirestore();
+  updateSuppUrgency();
+}
+window.toggleSuppCheck = toggleSuppCheck;
+
+function updateSuppUrgency() {
+  TIME_SLOTS.forEach(slot => {
+    const urgency = getSuppUrgency(slot);
+    state.supplements.forEach(supp => {
+      if (!supp.times.includes(slot.key)) return;
+      const done = isSuppDone(supp.id, slot.key);
+      const el = document.getElementById(`supp-${supp.id}-${slot.key}`);
+      if (!el) return;
+      let bg, border, glow;
+      if (done) {
+        bg="#6fcf9722"; border="var(--green)"; glow="0 0 8px #6fcf9744";
+      } else if (urgency==="urgent") {
+        bg="#e07b3f22"; border="#e07b3f"; glow="0 0 8px #e07b3f44";
+      } else if (urgency==="past") {
+        bg="#ff444422"; border="#ff4444"; glow="0 0 6px #ff444433";
+      } else {
+        bg="var(--card2)"; border="var(--border)"; glow="none";
+      }
+      el.style.background=bg; el.style.borderColor=border; el.style.boxShadow=glow;
+    });
+  });
+}
+
+function waterMlConsumed() {
+  const log = state.waterLog[todayKey()] || 0;
+  return log * WATER_UNITS[state.waterUnit].mlPer;
+}
+function waterUnitsNeeded() {
+  return Math.ceil(state.waterGoal / WATER_UNITS[state.waterUnit].mlPer);
+}
+
+function renderHealth() {
+  const main = document.getElementById("main-content");
+  const wUnit = WATER_UNITS[state.waterUnit];
+  const unitsNeeded = waterUnitsNeeded();
+  const unitsDone = state.waterLog[todayKey()] || 0;
+  const mlDone = unitsDone * wUnit.mlPer;
+  const waterPct = Math.min(100, Math.round((mlDone / state.waterGoal) * 100));
+
+  // Group supplements by slot
+  const slotSupps = {};
+  TIME_SLOTS.forEach(s => {
+    slotSupps[s.key] = state.supplements.filter(sup => sup.times.includes(s.key));
+  });
+
+  main.innerHTML = `
+<div style="padding:24px 16px 100px;max-width:440px;margin:0 auto">
+
+  <!-- Header -->
+  <div style="margin-bottom:22px">
+    <div style="font-family:'Bebas Neue',sans-serif;font-size:34px;color:var(--text);letter-spacing:.04em;line-height:1">Health</div>
+    <div style="font-size:12px;color:var(--dim);font-family:'DM Mono',monospace">Hydration & Supplements</div>
+  </div>
+
+  <!-- ── WATER ────────────────────────────────────────────── -->
+  <div class="card" style="margin-bottom:16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <div class="section-label" style="margin-bottom:0">Water</div>
+      <div style="font-size:11px;color:${waterPct>=100?'var(--green)':'var(--gold)'};font-family:'DM Mono',monospace">${Math.round(mlDone)} / ${state.waterGoal} ml</div>
+    </div>
+
+    <!-- Progress bar -->
+    <div style="height:8px;background:#1e1e2e;border-radius:99px;overflow:hidden;margin-bottom:16px">
+      <div style="height:100%;width:${waterPct}%;background:${waterPct>=100?'linear-gradient(90deg,#6fcf97,#43b580)':'linear-gradient(90deg,#3ab4f2,#1e7fc4)'};border-radius:99px;transition:width .4s ease;box-shadow:${waterPct>=100?'0 0 8px #6fcf9799':'0 0 8px #3ab4f266'}"></div>
+    </div>
+
+    <!-- Unit selector -->
+    <div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">
+      ${Object.entries(WATER_UNITS).map(([k,u])=>`
+      <button onclick="setWaterUnit('${k}')" style="flex:1;min-width:60px;background:${state.waterUnit===k?'linear-gradient(135deg,#3ab4f2,#1e7fc4)':'var(--card2)'};border:1px solid ${state.waterUnit===k?'#3ab4f2':'var(--border)'};border-radius:8px;padding:7px 6px;color:${state.waterUnit===k?'#0d0b14':'var(--muted)'};font-family:'DM Mono',monospace;font-size:10px;cursor:pointer;line-height:1.3;text-align:center">
+        ${u.icon}<br>${u.label}
+      </button>`).join("")}
+    </div>
+
+    <!-- Daily goal input -->
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center">
+      <div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;white-space:nowrap">Daily goal:</div>
+      <input id="water-goal-inp" type="number" value="${state.waterGoal}" class="inp" style="flex:1;text-align:center" placeholder="2000"/>
+      <div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace">ml</div>
+      <button onclick="saveWaterGoal()" class="btn-gold" style="padding:8px 12px;font-size:12px">Set</button>
+    </div>
+
+    <!-- Water bottle grid -->
+    <div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;margin-bottom:10px;letter-spacing:.08em">TAP TO LOG — ${unitsDone}/${unitsNeeded} ${wUnit.label}</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      ${Array.from({length:unitsNeeded}).map((_,i)=>{
+        const filled = i < unitsDone;
+        return `<button onclick="logWater(${i})" style="width:44px;height:54px;background:${filled?'linear-gradient(180deg,#3ab4f2,#1e7fc4)':'var(--card2)'};border:1px solid ${filled?'#3ab4f2':'var(--border)'};border-radius:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;transition:all .2s;box-shadow:${filled?'0 0 8px #3ab4f244':'none'};font-size:20px;padding:0">
+          ${filled?wUnit.icon:'<span style="font-size:20px;opacity:.25">'+wUnit.icon+'</span>'}
+          <div style="font-size:8px;font-family:DM Mono,monospace;color:${filled?'#0d0b14':'var(--faint)'}">${i+1}</div>
+        </button>`;
+      }).join("")}
+    </div>
+    ${unitsDone > 0 ? `<button onclick="resetWater()" style="margin-top:12px;background:none;border:none;color:var(--faint);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;text-decoration:underline">Reset today</button>` : ''}
+  </div>
+
+  <!-- ── SUPPLEMENTS ──────────────────────────────────────── -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div class="section-label" style="margin-bottom:0">Supplements</div>
+    <button onclick="openSuppEditor()" class="btn-gold" style="font-size:13px;padding:6px 14px">+ Add</button>
+  </div>
+
+  ${state.supplements.length===0?`
+  <div class="card" style="border-style:dashed;text-align:center;padding:24px 20px;margin-bottom:16px">
+    <div style="font-size:26px;margin-bottom:8px">💊</div>
+    <div style="color:var(--faint);font-family:'DM Mono',monospace;font-size:13px">No supplements added yet</div>
+  </div>`:''}
+
+  ${TIME_SLOTS.map(slot => {
+    const supps = slotSupps[slot.key];
+    if (!supps.length) return '';
+    const urgency = getSuppUrgency(slot);
+    const slotColor = urgency==="urgent"?"#e07b3f":urgency==="past"?"#ff444488":urgency==="active"?"var(--gold)":"var(--dim)";
+    const allDone = supps.every(s=>isSuppDone(s.id,slot.key));
+    return `
+    <div class="card" style="margin-bottom:12px;border-color:${allDone?'#6fcf9733':'var(--border2)'}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:18px">${slot.icon}</span>
+          <span style="font-family:'Bebas Neue',sans-serif;font-size:18px;color:${slotColor};letter-spacing:.05em">${slot.label}</span>
+          <span style="font-size:10px;color:var(--dim);font-family:'DM Mono',monospace">${slot.start}:00–${slot.end}:00</span>
+        </div>
+        ${urgency==="urgent"?`<span style="font-size:10px;color:#e07b3f;font-family:'DM Mono',monospace;animation:pulse 1.5s infinite">⚠ NOW</span>`:''}
+        ${allDone?`<span style="font-size:10px;color:var(--green);font-family:'DM Mono',monospace">✓ Done</span>`:''}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${supps.map(s => {
+          const done = isSuppDone(s.id, slot.key);
+          let bg, border, glow;
+          if (done) { bg="#6fcf9722"; border="var(--green)"; glow="0 0 8px #6fcf9744"; }
+          else if (urgency==="urgent") { bg="#e07b3f22"; border="#e07b3f"; glow="0 0 8px #e07b3f44"; }
+          else if (urgency==="past") { bg="#ff444422"; border="#ff4444"; glow="0 0 6px #ff444433"; }
+          else { bg="var(--card2)"; border="var(--border)"; glow="none"; }
+          return `
+          <div id="supp-${s.id}-${slot.key}" onclick="toggleSuppCheck('${s.id}','${slot.key}')"
+            style="display:flex;align-items:center;gap:10px;background:${bg};border:1px solid ${border};border-radius:10px;padding:10px 13px;cursor:pointer;transition:all .3s;box-shadow:${glow}">
+            <div style="width:18px;height:18px;border-radius:5px;border:2px solid ${done?'var(--green)':border};background:${done?'var(--green)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;color:#0d0b14;transition:all .2s">
+              ${done?'✓':''}
+            </div>
+            <div style="flex:1">
+              <div style="font-family:'DM Mono',monospace;font-size:13px;color:${done?'var(--dim)':'var(--text)'};text-decoration:${done?'line-through':'none'}">${s.name}</div>
+              ${s.dosage?`<div style="font-size:11px;color:var(--faint);font-family:'DM Mono',monospace">${s.dosage}</div>`:''}
+            </div>
+            <span onclick="event.stopPropagation();removeSupp('${s.id}')" style="color:var(--faint);font-size:15px;cursor:pointer;padding:4px">×</span>
+          </div>`;
+        }).join("")}
+      </div>
+    </div>`;
+  }).join("")}
+
+</div>
+
+<!-- Supplement Editor Modal -->
+<div id="supp-modal" style="display:none;position:fixed;inset:0;background:#0d0b14cc;z-index:100;align-items:flex-end;justify-content:center">
+  <div style="background:var(--bg);border:1px solid var(--border2);border-radius:20px 20px 0 0;padding:24px 20px;width:100%;max-width:480px;max-height:80vh;overflow-y:auto;box-sizing:border-box">
+    <div style="font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--gold);letter-spacing:.05em;margin-bottom:16px">Add Supplement</div>
+    <input id="supp-name" class="inp" placeholder="Name (e.g. Whey Protein)" style="width:100%;box-sizing:border-box;margin-bottom:10px"/>
+    <input id="supp-dosage" class="inp" placeholder="Dosage (e.g. 30g, 2 caps)" style="width:100%;box-sizing:border-box;margin-bottom:14px"/>
+    <div class="section-label">Take at</div>
+    <div style="display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap">
+      ${TIME_SLOTS.map(s=>`
+      <button id="slot-btn-${s.key}" onclick="toggleSlotBtn('${s.key}')"
+        style="flex:1;min-width:80px;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px 8px;color:var(--muted);font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;text-align:center;transition:all .2s">
+        ${s.icon} ${s.label}
+      </button>`).join("")}
+    </div>
+    <div style="display:flex;gap:8px">
+      <button onclick="closeSuppEditor()" class="btn-ghost" style="flex:1;padding:12px">Cancel</button>
+      <button onclick="saveSupp()" style="flex:1;background:linear-gradient(135deg,var(--gold),var(--orange));border:none;border-radius:12px;padding:12px;color:#0d0b14;font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:.04em;cursor:pointer">Save</button>
+    </div>
+  </div>
+</div>`;
+
+  updateSuppUrgency();
+}
+
+// ── Water actions ──────────────────────────────────────────────────────────
+window.setWaterUnit = (u) => { state.waterUnit=u; saveToFirestore(); renderHealth(); };
+window.saveWaterGoal = () => {
+  const v = parseInt(document.getElementById("water-goal-inp").value);
+  if (v>0) { state.waterGoal=v; saveToFirestore(); renderHealth(); }
+};
+window.logWater = (i) => {
+  const dk = todayKey();
+  const cur = state.waterLog[dk] || 0;
+  // Toggle: clicking a filled bottle unfills from that point; clicking empty fills up to it
+  state.waterLog[dk] = (i < cur) ? i : i + 1;
+  saveToFirestore(); renderHealth();
+};
+window.resetWater = () => { state.waterLog[todayKey()]=0; saveToFirestore(); renderHealth(); };
+
+// ── Supplement actions ─────────────────────────────────────────────────────
+let selectedSlots = new Set();
+window.openSuppEditor = () => {
+  selectedSlots = new Set();
+  document.getElementById("supp-name").value="";
+  document.getElementById("supp-dosage").value="";
+  TIME_SLOTS.forEach(s => {
+    const b = document.getElementById(`slot-btn-${s.key}`);
+    if (b) { b.style.background="var(--card2)"; b.style.borderColor="var(--border)"; b.style.color="var(--muted)"; }
+  });
+  document.getElementById("supp-modal").style.display="flex";
+};
+window.closeSuppEditor = () => { document.getElementById("supp-modal").style.display="none"; };
+window.toggleSlotBtn = (key) => {
+  if (selectedSlots.has(key)) {
+    selectedSlots.delete(key);
+    const b=document.getElementById(`slot-btn-${key}`);
+    b.style.background="var(--card2)"; b.style.borderColor="var(--border)"; b.style.color="var(--muted)";
+  } else {
+    selectedSlots.add(key);
+    const b=document.getElementById(`slot-btn-${key}`);
+    b.style.background="linear-gradient(135deg,var(--gold),var(--orange))"; b.style.borderColor="var(--gold)"; b.style.color="#0d0b14";
+  }
+};
+window.saveSupp = () => {
+  const name = document.getElementById("supp-name").value.trim();
+  if (!name || selectedSlots.size===0) return;
+  state.supplements.push({ id:uid2(), name, dosage:document.getElementById("supp-dosage").value.trim(), times:[...selectedSlots] });
+  saveToFirestore(); closeSuppEditor(); renderHealth();
+};
+window.removeSupp = (id) => { state.supplements=state.supplements.filter(s=>s.id!==id); saveToFirestore(); renderHealth(); };
+window.renderHealth = renderHealth;
 </script>
 
 <style>
@@ -616,6 +903,11 @@ window.renderFitness = renderFitness;
 
   /* Scrollbar hide */
   ::-webkit-scrollbar { display:none; }
+
+  @keyframes pulse {
+    0%,100% { opacity:1; }
+    50% { opacity:0.4; }
+  }
 </style>
 </head>
 <body>
@@ -641,6 +933,7 @@ window.renderFitness = renderFitness;
   <div id="tab-bar">
     <button class="tab-btn active" data-tab="daily" onclick="switchTab('daily')"><span>🗓</span>Daily</button>
     <button class="tab-btn" data-tab="fitness" onclick="switchTab('fitness')"><span>🏋️</span>Fitness</button>
+    <button class="tab-btn" data-tab="health" onclick="switchTab('health')"><span>💊</span>Health</button>
   </div>
 </div>
 
