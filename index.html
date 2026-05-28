@@ -6,6 +6,8 @@
 <title>Dashboard</title>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet" />
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<!-- QR Code Scanner -->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 
 <!-- Firebase -->
 <script type="module">
@@ -248,7 +250,7 @@ window.removeGoal = (id) => { state.todayGoals=state.todayGoals.filter(x=>x.id!=
 window.removeTomorrowGoal = (id) => { state.tomorrowGoals=state.tomorrowGoals.filter(x=>x.id!==id); saveToFirestore(); };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// FITNESS PAGE
+// FITNESS PAGE (INTEGRATED WITH AI COACHING)
 // ═══════════════════════════════════════════════════════════════════════════
 function renderFitness() {
   if (activeWorkout) { renderWorkoutSession(); return; }
@@ -269,6 +271,7 @@ function renderFitness() {
       <span onclick="setLb(true)" style="font-size:11px;font-family:'DM Mono',monospace;color:${useLb?'var(--gold)':'var(--dim)'};cursor:pointer">LB</span>
     </div>
   </div>
+  
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
     <div class="section-label">Your Routines</div>
     <button class="btn-gold" onclick="openRoutineEditor(null)" style="font-size:14px;padding:6px 14px">+ New</button>
@@ -291,8 +294,20 @@ function renderFitness() {
       <button onclick="startWorkout('${r.id}')" style="width:100%;background:linear-gradient(90deg,#f0c97222,#e07b3f22);border:none;border-top:1px solid var(--border);padding:12px;color:var(--gold);font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:.06em;cursor:pointer">START WORKOUT →</button>
     </div>`).join("")}
   </div>
+
+  <!-- INTEGRATED AI COACHING CONTAINER -->
+  <div id="ai-coaching-panel" class="coaching-card">
+    <div class="coaching-header">
+      <h3>🤖 AI Training Coach</h3>
+      <button id="refresh-coach-btn" onclick="window.aiCoach.updateInsights()">Refresh</button>
+    </div>
+    <div id="coaching-insights-container">
+      <p style="font-family:'DM Mono',monospace; font-size:11px; color:var(--faint); margin:0;">Analyzing training history...</p>
+    </div>
+  </div>
+
   ${allExercises.length>0?`
-  <div class="section-label" style="margin-bottom:12px">Progressive Overload</div>
+  <div class="section-label" style="margin-bottom:12px">Progressive Overload Tracking</div>
   <div style="display:flex;flex-direction:column;gap:10px">
     ${allExercises.map(name=>{
       const hist=state.exerciseHistory[name]||[], best=hist.length>0?Math.max(...hist.map(h=>h.weight)):null;
@@ -311,6 +326,7 @@ function renderFitness() {
     }).join("")}
   </div>`:''}
 </div>
+
 <div id="routine-modal" style="display:none;position:fixed;inset:0;background:#0d0b14cc;z-index:100;align-items:flex-end;justify-content:center">
   <div style="background:var(--bg);border:1px solid var(--border2);border-radius:20px 20px 0 0;padding:24px 20px;width:100%;max-width:480px;max-height:85vh;overflow-y:auto;box-sizing:border-box">
     <div id="modal-title" style="font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--gold);letter-spacing:.05em;margin-bottom:16px">New Routine</div>
@@ -327,6 +343,9 @@ function renderFitness() {
     </div>
   </div>
 </div>`;
+
+  // Fires the logic system to populate trends into the container dynamically
+  if (window.aiCoach) { window.aiCoach.updateInsights(); }
 }
 
 let modalExercises=[], editingRoutineId=null;
@@ -784,6 +803,127 @@ window.calSelectDay=(dk)=>{ calSelectedDay=calSelectedDay===dk?null:dk; renderCa
 window.toggleCalGoals=()=>{ calShowGoals=!calShowGoals; renderCalendar(); };
 window.toggleCalSupps=()=>{ calShowSupps=!calShowSupps; renderCalendar(); };
 window.reloadCal=()=>{ calRangeEvents={}; const days=calView==="week"?getWeekDays(calOffset):getMonthDays(calOffset); loadCalRangeEvents(days.filter(Boolean)); };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AI COACHING ENGINE - INTEGRATED FEATURE
+// ═══════════════════════════════════════════════════════════════════════════
+(function() {
+  // 1. Dynamic Styling Injection (Matches dashboard's minimal dark theme)
+  const style = document.createElement('style');
+  style.innerHTML = `
+    .coaching-card {
+      background: var(--card, #1e1a30);
+      border: 1px solid var(--border, #2a2440);
+      border-radius: 12px;
+      padding: 16px;
+      margin: 16px 0 24px 0;
+    }
+    .coaching-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .coaching-header h3 {
+      margin: 0;
+      font-family: 'Bebas Neue', sans-serif;
+      font-size: 22px;
+      color: var(--gold, #f0c972);
+      letter-spacing: .05em;
+    }
+    #refresh-coach-btn {
+      background: none;
+      border: 1px solid var(--border, #2a2440);
+      border-radius: 8px;
+      padding: 4px 10px;
+      color: var(--muted, #6b6485);
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    #refresh-coach-btn:hover {
+      border-color: var(--gold, #f0c972);
+      color: var(--gold, #f0c972);
+    }
+    .insight-item {
+      background: #17132a;
+      border-left: 3px solid var(--gold, #f0c972);
+      border-radius: 4px;
+      padding: 10px;
+      margin-bottom: 8px;
+    }
+    .insight-item.overload { border-left-color: #6fcf97; }
+    .insight-item.fatigue { border-left-color: #ff4444; }
+    .insight-title {
+      font-family: 'DM Mono', monospace;
+      font-size: 12px;
+      font-weight: 500;
+      margin-bottom: 2px;
+    }
+    .insight-desc {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      color: var(--dim, #9991b8);
+      line-height: 1.4;
+    }
+  `;
+  document.head.appendChild(style);
+
+  // 2. Logic Engine
+  class AICoachingEngine {
+    updateInsights() {
+      const history = (typeof state !== 'undefined' && state.exerciseHistory) ? state.exerciseHistory : {};
+      const container = document.getElementById('coaching-insights-container');
+      if (!container) return;
+
+      if (Object.keys(history).length === 0) {
+        container.innerHTML = `<p style="color:var(--faint, #6b6485); font-size:11px; font-family:'DM Mono',monospace; text-align:center; margin:10px 0;">Log a few working sets first. The coach needs session history to unlock optimization cues.</p>`;
+        return;
+      }
+
+      let insightsHTML = '';
+      const weightUnit = (typeof useLb !== 'undefined' && useLb) ? 'lb' : 'kg';
+
+      // Scan training performance patterns for plateaus or milestones
+      for (const [exerciseName, sessions] of Object.entries(history)) {
+        if (!Array.isArray(sessions) || sessions.length < 2) continue;
+        
+        const sorted = [...sessions];
+        const current = sorted[sorted.length - 1];
+        const previous = sorted[sorted.length - 2];
+        
+        const currentWeight = parseFloat(current.weight || 0);
+        const currentReps = parseInt(current.reps || 0);
+        const prevWeight = parseFloat(previous.weight || 0);
+        const prevReps = parseInt(previous.reps || 0);
+
+        // Milestone Check: Blocked weight and rep performance match perfectly
+        if (currentWeight === prevWeight && currentReps === prevReps && currentReps > 0) {
+          insightsHTML += `
+            <div class="insight-item overload">
+              <div class="insight-title" style="color:#6fcf97;">📈 Overload Cue: ${exerciseName}</div>
+              <div class="insight-desc">Matched <b>${currentWeight}${weightUnit} x ${currentReps}</b> reps back-to-back. Target +2.5kg or push for 1-2 extra reps next session to force performance adaptation.</div>
+            </div>
+          `;
+        }
+      }
+
+      if (!insightsHTML) {
+        insightsHTML = `
+          <div class="insight-item">
+            <div class="insight-title" style="color: var(--gold, #f0c972);">💪 Training Status: Optimal</div>
+            <div class="insight-desc">Consistently hitting your working baselines. Keep tracking your metrics to unlock specific auto-regulated progression goals.</div>
+          </div>
+        `;
+      }
+
+      container.innerHTML = insightsHTML;
+    }
+  }
+
+  window.aiCoach = new AICoachingEngine();
+})();
 
 </script>
 

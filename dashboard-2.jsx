@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
+import { CalorieTrackerPage } from "./CalorieTracker";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const HOUR_START = 6, HOUR_END = 24;
@@ -202,7 +203,7 @@ function ExerciseGraph({ history, useLb }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // ACTIVE WORKOUT SESSION
 // ══════════════════════════════════════════════════════════════════════════════
-function WorkoutSession({ routine, useLb, onFinish, exerciseHistory, setExerciseHistory }) {
+function WorkoutSession({ routine, useLb, onFinish, exerciseHistory, setExerciseHistory, setUseLb }) {
   const [current, setCurrent] = useState(0);
   const [sets, setSets] = useState(() => routine.exercises.map(() => [{ weight: "", reps: "" }]));
   const [done, setDone] = useState(false);
@@ -264,9 +265,19 @@ function WorkoutSession({ routine, useLb, onFinish, exerciseHistory, setExercise
           <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:22, color:C.gold, letterSpacing:"0.05em" }}>{routine.name}</div>
           <div style={{ fontSize:11, color:C.dim, fontFamily:"'DM Mono',monospace" }}>⏱ {fmt(elapsed)}</div>
         </div>
-        <button onClick={finishWorkout} style={{ background:C.card2, border:`1px solid ${C.border}`, borderRadius:10, padding:"8px 16px", color:C.green, fontFamily:"'DM Mono',monospace", fontSize:12, cursor:"pointer" }}>
-          Finish ✓
-        </button>
+        <div style={{ display:"flex", gap:8 }}>
+          {/* Weight unit toggle during workout */}
+          <div style={{ display:"flex", alignItems:"center", gap:4, background:C.card, border:`1px solid ${C.border}`, borderRadius:8, padding:"4px 8px" }}>
+            <button onClick={() => setUseLb(false)} style={{ background:"none", border:"none", color:!useLb?C.gold:C.faint, fontFamily:"'DM Mono',monospace", fontSize:11, cursor:"pointer", fontWeight:700 }}>KG</button>
+            <div style={{ width:20, height:12, background:useLb?C.gold:"#2a2440", borderRadius:99, position:"relative", cursor:"pointer", transition:"background 0.2s" }} onClick={() => setUseLb(x=>!x)}>
+              <div style={{ position:"absolute", top:1, left:useLb?9:1, width:10, height:10, borderRadius:99, background:useLb?"#0d0b14":C.muted, transition:"left 0.2s" }} />
+            </div>
+            <button onClick={() => setUseLb(true)} style={{ background:"none", border:"none", color:useLb?C.gold:C.faint, fontFamily:"'DM Mono',monospace", fontSize:11, cursor:"pointer", fontWeight:700 }}>LB</button>
+          </div>
+          <button onClick={finishWorkout} style={{ background:C.card2, border:`1px solid ${C.border}`, borderRadius:10, padding:"8px 16px", color:C.green, fontFamily:"'DM Mono',monospace", fontSize:12, cursor:"pointer" }}>
+            Finish ✓
+          </button>
+        </div>
       </div>
 
       {/* Exercise nav pills */}
@@ -397,7 +408,7 @@ function FitnessPage() {
 
   if (activeRoutine) return (
     <WorkoutSession
-      routine={activeRoutine} useLb={useLb}
+      routine={activeRoutine} useLb={useLb} setUseLb={setUseLb}
       onFinish={() => setActiveRoutine(null)}
       exerciseHistory={exerciseHistory} setExerciseHistory={setExerciseHistory}
     />
@@ -524,12 +535,13 @@ export default function App() {
     <div style={{ background:C.bg, minHeight:"100vh", color:C.text }}>
       <Fonts />
       <div style={{ paddingBottom:80 }}>
-        {tab === "daily" ? <DailyPage /> : <FitnessPage />}
+        {tab === "daily" ? <DailyPage /> : tab === "fitness" ? <FitnessPage /> : <CalorieTrackerPage />}
       </div>
       {/* Bottom tab bar */}
       <div style={{ position:"fixed", bottom:0, left:0, right:0, background:`${C.bg}ee`, borderTop:`1px solid ${C.border}`, display:"flex", backdropFilter:"blur(12px)", zIndex:50 }}>
         {tabBtn("daily", "Daily", "🗓")}
         {tabBtn("fitness", "Fitness", "🏋️")}
+        {tabBtn("nutrition", "Nutrition", "🍽")}
       </div>
     </div>
   );
