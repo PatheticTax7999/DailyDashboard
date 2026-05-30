@@ -1,0 +1,1347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head> 
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<!-- PWA Manifest Connection -->
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#121212">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+<!-- Firebase -->
+<script type="module">
+  // Register the PWA Service Worker
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js')
+        .then(reg => console.log('Service Worker registered successfully. Scope:', reg.scope))
+        .catch(err => console.error('Service Worker registration failed:', err));
+    });
+  }
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js";
+import { getAuth, signInWithPopup, signOut, GoogleAuthProvider, onAuthStateChanged } 
+  from "https://www.gstatic.com/firebasejs/12.11.0/firebase-auth.js";
+import { getFirestore, doc, setDoc, onSnapshot } 
+  from "https://www.gstatic.com/firebasejs/12.11.0/firebase-firestore.js";
+import { getAI, getGenerativeModel } 
+  from "https://www.gstatic.com/firebasejs/12.11.0/firebase-ai.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyD7N3IMhCShtARUDJ3ClP8TniRbDu71TCk",
+  authDomain: "life-dashboard-3d309.firebaseapp.com",
+  projectId: "life-dashboard-3d309",
+  appId: "1:920483424217:web:99867c36c968814dbadbc8"
+};
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+const provider = new GoogleAuthProvider();
+const ai = getAI(app);
+
+// ─── STATE ───────────────────────────────────────────────────────────────────
+let uid = null, unsubscribe = null, useLb = false;
+let activeWorkout = null, workoutTimer = null, chartInstances = {};
+
+let state = {
+  todayGoals: [], tomorrowGoals: [], lastDate: null,
+  routines: [], exerciseHistory: {},
+  supplements: [], suppChecks: {},
+  waterGoal: 2000, waterUnit: 'ml', waterLog: {},
+  weightLog: []  // NEW: array of {date, weight} objects
+};
+
+// ─── UTILS ───────────────────────────────────────────────────────────────────
+const HOUR_START = 6, HOUR_END = 24, KG_TO_LB = 2.20462;
+const uid2 = () => Math.random().toString(36).slice(2,9);
+const fmtWeight = (kg,lb) => lb?`${(kg*KG_TO_LB).toFixed(1)} lb`:`${kg} kg`;
+const getTime  = () => new Date().toLocaleTimeString("en-AU",{hour:"2-digit",minute:"2-digit"});
+const getDate  = () => new Date().toLocaleDateString("en-AU",{weekday:"long",day:"numeric",month:"long"});
+const getGreeting = () => { const h=new Date().getHours(); return h<12?"Good morning":h<17?"Good afternoon":"Good evening"; };
+const getDayPct   = () => { const h=new Date().getHours()+new Date().getMinutes()/60; return Math.min(1,Math.max(0,(h-HOUR_START)/(HOUR_END-HOUR_START))); };
+const fmtTimer = s => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+const todayKey = () => new Date().toISOString().slice(0,10);
+
+// ─── FIRESTORE ───────────────────────────────────────────────────────────────
+async function saveToFirestore() {
+  if (!uid) return;
+  try {
+    await setDoc(doc(db,"users",uid),{
+      todayGoals:state.todayGoals, tomorrowGoals:state.tomorrowGoals, lastDate:state.lastDate,
+      routines:state.routines, exerciseHistory:state.exerciseHistory, useLb,
+      supplements:state.supplements, suppChecks:state.suppChecks,
+      waterGoal:state.waterGoal, waterUnit:state.waterUnit, waterLog:state.waterLog,
+      weightLog:state.weightLog
+    });
+  } catch(e){ console.error("Save error",e); }
+}
+
+function subscribeToFirestore() {
+  if (unsubscribe) unsubscribe();
+  unsubscribe = onSnapshot(doc(db,"users",uid),(snap)=>{
+    if (snap.exists()) {
+      const d = snap.data();
+      const today = new Date().toDateString();
+
+      // ── Goal roll-over (only affects todayGoals/tomorrowGoals, never routines/supplements) ──
+      if (d.lastDate && d.lastDate!==today && d.tomorrowGoals?.length) {
+        state.todayGoals=[...(d.todayGoals||[]).filter(g=>!g.done),...(d.tomorrowGoals||[]).map(g=>({...g,done:false}))];
+        state.tomorrowGoals=[]; state.lastDate=today; saveToFirestore();
+      } else {
+        state.todayGoals=d.todayGoals||[]; state.tomorrowGoals=d.tomorrowGoals||[]; state.lastDate=d.lastDate||today;
+      }
+
+      // ── Routines & supplements: always load as-is, NEVER reset ──
+      state.routines=d.routines||[];
+      state.exerciseHistory=d.exerciseHistory||{};
+      useLb=d.useLb||false;
+      state.supplements=d.supplements||[];
+
+      // ── suppChecks: only keep today's key + yesterday's to avoid bloat ──
+      // Load all suppChecks from Firestore — do NOT wipe them
+      state.suppChecks=d.suppChecks||{};
+
+      state.waterGoal=d.waterGoal??2000;
+      state.waterUnit=d.waterUnit||'ml';
+      // Only keep today's water log entry
+      const allWaterLog=d.waterLog||{};
+      state.waterLog=allWaterLog;
+
+      state.weightLog=d.weightLog||[];
+    } else {
+      state.lastDate=new Date().toDateString();
+      saveToFirestore();
+    }
+    renderCurrentTab();
+  });
+}
+
+// ─── AUTH ────────────────────────────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  if (user) {
+    uid=user.uid; subscribeToFirestore();
+    document.getElementById("auth-screen").style.display="none";
+    document.getElementById("app").style.display="block";
+    document.getElementById("user-avatar").textContent=user.displayName?.charAt(0).toUpperCase()||"?";
+    document.getElementById("user-name").textContent=user.displayName||"User";
+  } else {
+    uid=null; if(unsubscribe){unsubscribe();unsubscribe=null;}
+    document.getElementById("auth-screen").style.display="flex";
+    document.getElementById("app").style.display="none";
+  }
+});
+window.signInGoogle  = async()=>{ try{await signInWithPopup(auth,provider);}catch(e){console.error(e);} };
+window.signOutUser   = async()=>{ try{await signOut(auth);}catch(e){console.error(e);} };
+
+// ─── TAB NAV ─────────────────────────────────────────────────────────────────
+let currentTab = "home";
+window.switchTab = (tab) => {
+  currentTab=tab;
+  document.querySelectorAll(".tab-btn").forEach(b=>b.classList.toggle("active",b.dataset.tab===tab));
+  renderCurrentTab();
+};
+function renderCurrentTab() {
+  if (currentTab==="home")     renderHome();
+  else if (currentTab==="fitness")  renderFitness();
+  else if (currentTab==="health")   renderHealth();
+  else if (currentTab==="calendar") renderCalendar();
+}
+
+// ─── CLOCK TICK ──────────────────────────────────────────────────────────────
+setInterval(()=>{
+  if (currentTab==="home"){
+    const tw=document.getElementById("time-text"), tp=document.getElementById("time-pct");
+    if(tw){tw.textContent=getTime();const p=getDayPct();tp.textContent=`${Math.round(p*100)}% of day`;updateWheel(p);}
+  }
+  if (currentTab==="health") updateSuppUrgency();
+  if (activeWorkout){ const el=document.getElementById("workout-timer"); if(el) el.textContent="⏱ "+fmtTimer(Math.floor((Date.now()-activeWorkout.startTime)/1000)); }
+},10000);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HOME PAGE
+// ═══════════════════════════════════════════════════════════════════════════
+function updateWheel(p) {
+  const svg=document.getElementById("wheel-svg"); if(!svg) return;
+  const size=200,stroke=12,r=(size-stroke)/2,circ=2*Math.PI*r;
+  const arc=svg.getElementById("wheel-arc"), dot=svg.getElementById("wheel-dot");
+  if(arc) arc.style.strokeDashoffset=circ*(1-p);
+  const angle=p*360-90,rad=(angle*Math.PI)/180;
+  const cx=size/2+r*Math.cos(rad),cy=size/2+r*Math.sin(rad);
+  if(dot&&p>0.01){dot.setAttribute("cx",cx);dot.setAttribute("cy",cy);dot.style.display="";}
+}
+
+function renderHome() {
+  const p=getDayPct(), size=200, stroke=12, r=(size-stroke)/2, circ=2*Math.PI*r;
+  const offset=circ*(1-p), angle=p*360-90, rad=(angle*Math.PI)/180;
+  const cx=size/2+r*Math.cos(rad), cy=size/2+r*Math.sin(rad);
+  const done=state.todayGoals.filter(g=>g.done).length, total=state.todayGoals.length;
+  const pct=total===0?0:Math.round((done/total)*100);
+  const schedItems = buildTodaySchedule();
+
+  const main=document.getElementById("main-content");
+  main.innerHTML=`
+<div style="padding:22px 16px 100px;max-width:440px;margin:0 auto">
+  <div style="text-align:center;margin-bottom:18px">
+    <div style="font-size:11px;color:var(--dim);letter-spacing:.15em;text-transform:uppercase;margin-bottom:4px">${getDate()}</div>
+    <div style="font-size:26px;font-family:'DM Serif Display',serif;color:var(--text)">${getGreeting()}</div>
+  </div>
+  <div style="display:flex;justify-content:center;margin-bottom:22px">
+    <svg id="wheel-svg" width="${size}" height="${size}" style="filter:drop-shadow(0 0 16px #f0c97233)">
+      <defs><linearGradient id="wg" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" stop-color="#f0c972"/><stop offset="100%" stop-color="#e07b3f"/>
+      </linearGradient></defs>
+      <circle cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="#1e1e2e" stroke-width="${stroke}"/>
+      <circle id="wheel-arc" cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="url(#wg)" stroke-width="${stroke}"
+        stroke-dasharray="${circ}" stroke-dashoffset="${offset}" stroke-linecap="round"
+        transform="rotate(-90 ${size/2} ${size/2})" style="transition:stroke-dashoffset 1s ease"/>
+      <circle id="wheel-dot" cx="${cx}" cy="${cy}" r="5" fill="#f0c972" style="filter:drop-shadow(0 0 5px #f0c972);display:${p>0.01?'':'none'}"/>
+      <text id="time-text" x="${size/2}" y="${size/2-12}" text-anchor="middle" fill="#f0c972" font-size="24" font-family="'DM Serif Display',serif">${getTime()}</text>
+      <text id="time-pct"  x="${size/2}" y="${size/2+12}" text-anchor="middle" fill="#9991b8" font-size="12" font-family="'DM Mono',monospace">${Math.round(p*100)}% of day</text>
+      <text x="${size/2}" y="${size/2+30}" text-anchor="middle" fill="#6b6485" font-size="10" font-family="'DM Mono',monospace">${HOUR_START}:00 → ${HOUR_END}:00</text>
+    </svg>
+  </div>
+  <div class="card" style="margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div class="section-label" style="margin-bottom:0">Today's Goals</div>
+      <span style="font-size:11px;font-family:'DM Mono',monospace;color:${pct===100?'var(--green)':'var(--gold)'}">${done}/${total} — ${pct}%</span>
+    </div>
+    <div style="height:5px;background:#1e1e2e;border-radius:99px;overflow:hidden;margin-bottom:12px">
+      <div style="height:100%;width:${pct}%;background:${pct===100?'linear-gradient(90deg,#6fcf97,#43b580)':'linear-gradient(90deg,#f0c972,#e07b3f)'};border-radius:99px;transition:width .5s ease"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input id="new-today" class="inp" placeholder="Add a goal..." onkeydown="if(event.key==='Enter')addTodayGoal()" style="flex:1"/>
+      <button class="btn-gold" onclick="addTodayGoal()">+</button>
+    </div>
+    <div>
+      ${state.todayGoals.length===0?`<div style="color:var(--faint);font-size:12px;text-align:center;padding:8px 0;font-family:'DM Mono',monospace">No goals yet</div>`:''}
+      ${state.todayGoals.map(g=>`
+      <div class="goal-row${g.done?' done':''}" style="margin-bottom:7px">
+        <div class="checkbox${g.done?' checked':''}" onclick="toggleGoal('${g.id}')">${g.done?'✓':''}</div>
+        <span style="flex:1;font-size:13px;font-family:'DM Mono',monospace;color:${g.done?'var(--faint)':'var(--text)'};text-decoration:${g.done?'line-through':'none'}">${g.text}</span>
+        <span onclick="removeGoal('${g.id}')" style="color:var(--faint);cursor:pointer;font-size:16px;line-height:1">×</span>
+      </div>`).join("")}
+    </div>
+  </div>
+  <div class="card" style="background:var(--card-darker);border-color:var(--border);margin-bottom:20px">
+    <div class="section-label" style="color:var(--faint)">Tomorrow's Goals</div>
+    <div style="font-size:11px;color:#2e2845;margin-bottom:10px;font-family:'DM Mono',monospace">Auto-rolls into today at midnight</div>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input id="new-tomorrow" class="inp" placeholder="Plan ahead..." onkeydown="if(event.key==='Enter')addTomorrowGoal()" style="flex:1;background:#17132a;border-color:var(--border)"/>
+      <button class="btn-purple" onclick="addTomorrowGoal()">+</button>
+    </div>
+    <div>
+      ${state.tomorrowGoals.length===0?`<div style="color:#2e2845;font-size:12px;text-align:center;padding:8px 0;font-family:'DM Mono',monospace">Nothing queued</div>`:''}
+      ${state.tomorrowGoals.map(g=>`
+      <div class="goal-row" style="margin-bottom:7px;background:#17132a;border-color:var(--border)">
+        <div style="width:17px;height:17px;border-radius:4px;border:2px solid #2e2845;flex-shrink:0"></div>
+        <span style="flex:1;font-size:13px;font-family:'DM Mono',monospace;color:var(--dim)">${g.text}</span>
+        <span onclick="removeTomorrowGoal('${g.id}')" style="color:#2e2845;cursor:pointer;font-size:16px">×</span>
+      </div>`).join("")}
+    </div>
+  </div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div class="section-label" style="margin-bottom:0">Today's Schedule</div>
+    ${gcalAccessToken
+      ? `<div style="display:flex;gap:6px">
+           <button onclick="gcalRefresh()" style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:5px 9px;color:var(--muted);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer">↻</button>
+           <button onclick="gcalDisconnect()" style="background:none;border:1px solid var(--border);border-radius:8px;padding:5px 9px;color:var(--faint);font-family:'DM Mono',monospace;font-size:10px;cursor:pointer">Disconnect</button>
+         </div>`
+      : `<button onclick="gcalConnect()" style="background:linear-gradient(135deg,#4285F4,#1a6fd4);border:none;border-radius:8px;padding:6px 12px;color:#fff;font-family:'DM Mono',monospace;font-size:11px;cursor:pointer">+ Connect Google Cal</button>`
+    }
+  </div>
+  ${gcalLoading?`<div style="display:flex;align-items:center;gap:10px;padding:20px 0;color:var(--muted);font-family:'DM Mono',monospace;font-size:13px"><div style="width:16px;height:16px;border:2px solid var(--gold);border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite"></div>Loading…</div>`:''}
+  ${gcalError?`<div style="background:#ff444422;border:1px solid #ff444466;border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:#ff6b6b;font-family:'DM Mono',monospace">${gcalError}</div>`:''}
+  ${!gcalLoading && schedItems.length===0 && gcalAccessToken?`<div style="text-align:center;padding:20px;color:var(--faint);font-family:'DM Mono',monospace;font-size:12px">No events today</div>`:''}
+  ${!gcalLoading && !gcalAccessToken && state.supplements.length===0?'':`
+  <div style="display:flex;flex-direction:column;gap:8px">
+    ${schedItems.map(item=>renderScheduleItem(item,'home')).join("")}
+  </div>`}
+</div>`;
+}
+
+window.addTodayGoal = () => { const i=document.getElementById("new-today"); const v=i.value.trim(); if(!v) return; state.todayGoals.push({id:uid2(),text:v,done:false}); i.value=""; saveToFirestore(); };
+window.addTomorrowGoal = () => { const i=document.getElementById("new-tomorrow"); const v=i.value.trim(); if(!v) return; state.tomorrowGoals.push({id:uid2(),text:v,done:false}); i.value=""; saveToFirestore(); };
+window.toggleGoal = (id) => { const g=state.todayGoals.find(x=>x.id===id); if(g){g.done=!g.done;saveToFirestore();if(currentTab==="home")renderHome();} };
+window.removeGoal = (id) => { state.todayGoals=state.todayGoals.filter(x=>x.id!==id); saveToFirestore(); };
+window.removeTomorrowGoal = (id) => { state.tomorrowGoals=state.tomorrowGoals.filter(x=>x.id!==id); saveToFirestore(); };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FITNESS PAGE
+// ═══════════════════════════════════════════════════════════════════════════
+function renderFitness() {
+  if (activeWorkout) { renderWorkoutSession(); return; }
+  const allExercises=[...new Set(state.routines.flatMap(r=>r.exercises.map(e=>e.name)))];
+  const main=document.getElementById("main-content");
+  main.innerHTML=`
+<div style="padding:24px 16px 100px;max-width:440px;margin:0 auto">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px">
+    <div>
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:34px;color:var(--text);letter-spacing:.04em;line-height:1">Fitness</div>
+      <div style="font-size:12px;color:var(--dim);font-family:'DM Mono',monospace">Track. Lift. Progress.</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border2);border-radius:10px;padding:8px 12px">
+      <span onclick="setLb(false)" style="font-size:11px;font-family:'DM Mono',monospace;color:${!useLb?'var(--gold)':'var(--dim)'};cursor:pointer">KG</span>
+      <div onclick="toggleLb()" style="width:32px;height:18px;background:${useLb?'var(--gold)':'#2a2440'};border-radius:99px;position:relative;cursor:pointer;transition:background .2s">
+        <div style="position:absolute;top:2px;left:${useLb?'14px':'2px'};width:14px;height:14px;border-radius:99px;background:${useLb?'#0d0b14':'var(--muted)'};transition:left .2s"></div>
+      </div>
+      <span onclick="setLb(true)" style="font-size:11px;font-family:'DM Mono',monospace;color:${useLb?'var(--gold)':'var(--dim)'};cursor:pointer">LB</span>
+    </div>
+  </div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div class="section-label">Your Routines</div>
+    <button class="btn-gold" onclick="openRoutineEditor(null)" style="font-size:14px;padding:6px 14px">+ New</button>
+  </div>
+  ${state.routines.length===0?`<div class="card" style="border-style:dashed;text-align:center;padding:28px 20px;margin-bottom:20px"><div style="font-size:28px;margin-bottom:8px">🏋️</div><div style="color:var(--faint);font-family:'DM Mono',monospace;font-size:13px">No routines yet — create your first one</div></div>`:''}
+  <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:24px">
+  ${state.routines.map(r=>`
+    <div class="card" style="padding:0;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:12px;padding:14px 16px">
+        <div style="flex:1">
+          <div style="font-family:'Bebas Neue',sans-serif;font-size:20px;color:var(--text);letter-spacing:.04em">${r.name}</div>
+          <div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace">${r.exercises.length} exercise${r.exercises.length!==1?'s':''}</div>
+        </div>
+        <button onclick="openRoutineEditor('${r.id}')" class="btn-ghost" style="font-size:11px;padding:6px 10px">Edit</button>
+        <span onclick="deleteRoutine('${r.id}')" style="color:var(--faint);cursor:pointer;font-size:18px;line-height:1">×</span>
+      </div>
+      <div style="padding:0 16px 12px;display:flex;gap:6px;flex-wrap:wrap">
+        ${r.exercises.map(e=>`<span style="background:#1e1a30;border-radius:6px;padding:3px 8px;font-size:11px;color:var(--muted);font-family:'DM Mono',monospace">${e.name}</span>`).join("")}
+      </div>
+      <button onclick="startWorkout('${r.id}')" style="width:100%;background:linear-gradient(90deg,#f0c97222,#e07b3f22);border:none;border-top:1px solid var(--border);padding:12px;color:var(--gold);font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:.06em;cursor:pointer">START WORKOUT →</button>
+    </div>`).join("")}
+  </div>
+
+  ${allExercises.length>0?`
+  <div class="section-label" style="margin-bottom:12px">Progressive Overload Tracking</div>
+  <div style="display:flex;flex-direction:column;gap:10px">
+    ${allExercises.map(name=>{
+      const hist=state.exerciseHistory[name]||[], best=hist.length>0?Math.max(...hist.map(h=>h.weight)):null;
+      return `<div class="card" style="overflow:hidden">
+        <div onclick="toggleExGraph('${name.replace(/'/g,"\\'")}',this)" style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;cursor:pointer">
+          <div>
+            <div style="font-family:'DM Mono',monospace;font-size:13px;color:var(--text)">${name}</div>
+            <div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;margin-top:2px">${hist.length} session${hist.length!==1?'s':''}${best!==null?`<span style="color:var(--gold);margin-left:8px">Best: ${fmtWeight(best,useLb)}</span>`:''}</div>
+          </div>
+          <span class="toggle-arrow" style="color:var(--faint);font-size:14px;font-family:'DM Mono',monospace">▼</span>
+        </div>
+        <div class="graph-panel" style="display:none;padding:0 16px 16px">
+          ${hist.length<2?`<div style="height:80px;display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:12px;font-family:'DM Mono',monospace">Log more sessions to see progress</div>`:`<canvas id="chart-${name.replace(/\s+/g,'_')}" height="90"></canvas>`}
+        </div>
+      </div>`;
+    }).join("")}
+  </div>`:''}
+</div>
+
+<div id="routine-modal" style="display:none;position:fixed;inset:0;background:#0d0b14cc;z-index:100;align-items:flex-end;justify-content:center">
+  <div style="background:var(--bg);border:1px solid var(--border2);border-radius:20px 20px 0 0;padding:24px 20px;width:100%;max-width:480px;max-height:85vh;overflow-y:auto;box-sizing:border-box">
+    <div id="modal-title" style="font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--gold);letter-spacing:.05em;margin-bottom:16px">New Routine</div>
+    <input id="routine-name" class="inp" placeholder="Routine name (e.g. Push Day)" style="width:100%;box-sizing:border-box;margin-bottom:14px"/>
+    <div class="section-label" style="margin-bottom:10px">Exercises</div>
+    <div id="exercise-list" style="margin-bottom:10px"></div>
+    <div style="display:flex;gap:8px;margin-bottom:20px">
+      <input id="new-exercise" class="inp" placeholder="Add exercise..." onkeydown="if(event.key==='Enter')addExerciseToModal()" style="flex:1"/>
+      <button class="btn-gold" onclick="addExerciseToModal()">+</button>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button onclick="closeRoutineEditor()" class="btn-ghost" style="flex:1;padding:12px">Cancel</button>
+      <button onclick="saveRoutine()" style="flex:1;background:linear-gradient(135deg,var(--gold),var(--orange));border:none;border-radius:12px;padding:12px;color:#0d0b14;font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:.04em;cursor:pointer">Save</button>
+    </div>
+  </div>
+</div>`;
+}
+
+let modalExercises=[], editingRoutineId=null;
+window.openRoutineEditor=(id)=>{
+  editingRoutineId=id; const r=id?state.routines.find(x=>x.id===id):null;
+  document.getElementById("modal-title").textContent=r?"Edit Routine":"New Routine";
+  document.getElementById("routine-name").value=r?r.name:"";
+  modalExercises=r?r.exercises.map(e=>({...e})):[];
+  renderModalExercises(); document.getElementById("routine-modal").style.display="flex";
+};
+window.closeRoutineEditor=()=>{ document.getElementById("routine-modal").style.display="none"; };
+function renderModalExercises(){
+  document.getElementById("exercise-list").innerHTML=modalExercises.map((ex,i)=>`
+    <div style="background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-family:'DM Mono',monospace;font-size:13px;color:var(--text)">${ex.name}</span>
+        <span onclick="removeModalExercise(${i})" style="color:var(--faint);cursor:pointer;font-size:16px">×</span>
+      </div>
+      <input class="inp" placeholder="Notes (e.g. 4×8, tempo 3-1-3)" value="${ex.notes||''}" oninput="modalExercises[${i}].notes=this.value" style="width:100%;box-sizing:border-box;font-size:12px;padding:6px 10px"/>
+    </div>`).join("");
+}
+window.addExerciseToModal=()=>{ const i=document.getElementById("new-exercise"); const v=i.value.trim(); if(!v) return; modalExercises.push({id:uid2(),name:v,notes:""}); i.value=""; renderModalExercises(); };
+window.removeModalExercise=(i)=>{ modalExercises.splice(i,1); renderModalExercises(); };
+window.saveRoutine=()=>{
+  const name=document.getElementById("routine-name").value.trim(); if(!name||modalExercises.length===0) return;
+  if(editingRoutineId) state.routines=state.routines.map(r=>r.id===editingRoutineId?{...r,name,exercises:modalExercises}:r);
+  else state.routines.push({id:uid2(),name,exercises:modalExercises});
+  saveToFirestore(); closeRoutineEditor();
+};
+window.deleteRoutine=(id)=>{ state.routines=state.routines.filter(r=>r.id!==id); saveToFirestore(); };
+window.toggleExGraph=(name,headerEl)=>{
+  const panel=headerEl.closest(".card").querySelector(".graph-panel"), arrow=headerEl.querySelector(".toggle-arrow");
+  const isOpen=panel.style.display!=="none"; panel.style.display=isOpen?"none":"block";
+  if(arrow) arrow.textContent=isOpen?"▼":"▲";
+  if(!isOpen){ const cid="chart-"+name.replace(/\s+/g,"_"), canvas=document.getElementById(cid); if(!canvas) return;
+    const hist=state.exerciseHistory[name]||[]; if(hist.length<2) return;
+    if(chartInstances[cid]) chartInstances[cid].destroy();
+    chartInstances[cid]=new Chart(canvas,{type:"line",data:{datasets:[{data:hist.map((h,i)=>({x:i+1,y:useLb?parseFloat((h.weight*KG_TO_LB).toFixed(1)):h.weight})),borderColor:"#f0c972",backgroundColor:"#f0c97222",borderWidth:2,pointBackgroundColor:"#f0c972",pointRadius:4,tension:0.3}]},options:{responsive:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${ctx.parsed.y} ${useLb?'lb':'kg'}`}}},scales:{x:{ticks:{color:"#6b6485",font:{family:"'DM Mono',monospace",size:10}},grid:{color:"#1e1a30"}},y:{ticks:{color:"#6b6485",font:{family:"'DM Mono',monospace",size:10}},grid:{color:"#1e1a30"}}}}});
+  }
+};
+window.toggleLb=()=>{ useLb=!useLb; saveToFirestore(); renderFitness(); };
+window.setLb=(v)=>{ useLb=v; saveToFirestore(); renderFitness(); };
+
+// ─── WORKOUT SESSION ──────────────────────────────────────────────────────────
+window.startWorkout=(routineId)=>{
+  const r=state.routines.find(x=>x.id===routineId); if(!r) return;
+  activeWorkout={routine:r,sets:r.exercises.map(()=>[{weight:"",reps:""}]),startTime:Date.now(),currentEx:0};
+  if(workoutTimer) clearInterval(workoutTimer);
+  workoutTimer=setInterval(()=>{ const el=document.getElementById("workout-timer"); if(el) el.textContent="⏱ "+fmtTimer(Math.floor((Date.now()-activeWorkout.startTime)/1000)); },1000);
+  renderWorkoutSession();
+};
+function renderWorkoutSession(){
+  const{routine,sets,currentEx}=activeWorkout, ex=routine.exercises[currentEx], exSets=sets[currentEx];
+  const elapsed=Math.floor((Date.now()-activeWorkout.startTime)/1000);
+  document.getElementById("main-content").innerHTML=`
+<div style="padding:20px 16px 100px;max-width:440px;margin:0 auto">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+    <div><div style="font-family:'Bebas Neue',sans-serif;font-size:22px;color:var(--gold);letter-spacing:.05em">${routine.name}</div>
+    <div id="workout-timer" style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace">⏱ ${fmtTimer(elapsed)}</div></div>
+    <button onclick="finishWorkout()" style="background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:8px 16px;color:var(--green);font-family:'DM Mono',monospace;font-size:12px;cursor:pointer">Finish ✓</button>
+  </div>
+  <div style="display:flex;gap:6px;overflow-x:auto;margin-bottom:20px;padding-bottom:4px;scrollbar-width:none">
+    ${routine.exercises.map((e,i)=>`<button onclick="switchExercise(${i})" style="flex-shrink:0;background:${i===currentEx?'linear-gradient(135deg,var(--gold),var(--orange))':'var(--card)'};border:1px solid ${i===currentEx?'var(--gold)':'var(--border)'};border-radius:20px;padding:6px 14px;color:${i===currentEx?'#0d0b14':'var(--muted)'};font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;white-space:nowrap">${e.name}</button>`).join("")}
+  </div>
+  <div class="card" style="margin-bottom:14px">
+    <div style="font-family:'Bebas Neue',sans-serif;font-size:28px;color:var(--text);letter-spacing:.04em;margin-bottom:${ex.notes?'4px':'14px'}">${ex.name}</div>
+    ${ex.notes?`<div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;margin-bottom:14px">${ex.notes}</div>`:''}
+    <div style="display:grid;grid-template-columns:28px 1fr 1fr 28px;gap:6px;margin-bottom:8px;align-items:center">
+      <div style="font-size:10px;color:var(--faint);font-family:'DM Mono',monospace;text-align:center">SET</div>
+      <div style="font-size:10px;color:var(--faint);font-family:'DM Mono',monospace;text-align:center">WEIGHT (${useLb?'lb':'kg'})</div>
+      <div style="font-size:10px;color:var(--faint);font-family:'DM Mono',monospace;text-align:center">REPS</div><div></div>
+    </div>
+    <div id="sets-container">
+      ${exSets.map((s,si)=>`<div style="display:grid;grid-template-columns:28px 1fr 1fr 28px;gap:6px;margin-bottom:6px;align-items:center">
+        <div style="text-align:center;font-family:'DM Mono',monospace;font-size:13px;color:var(--dim)">${si+1}</div>
+        <input type="number" value="${s.weight}" placeholder="0" oninput="updateSet(${currentEx},${si},'weight',this.value)" style="background:#1e1a30;border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text);font-family:'DM Mono',monospace;font-size:14px;text-align:center;outline:none;width:100%;box-sizing:border-box"/>
+        <input type="number" value="${s.reps}" placeholder="0" oninput="updateSet(${currentEx},${si},'reps',this.value)" style="background:#1e1a30;border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text);font-family:'DM Mono',monospace;font-size:14px;text-align:center;outline:none;width:100%;box-sizing:border-box"/>
+        <button onclick="removeSet(${currentEx},${si})" style="background:none;border:none;color:var(--faint);cursor:pointer;font-size:16px;padding:0">×</button>
+      </div>`).join("")}
+    </div>
+    <button onclick="addSet(${currentEx})" style="background:var(--card2);border:1px dashed var(--border);border-radius:8px;padding:7px 0;color:var(--muted);font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;width:100%;margin-top:4px">+ Add Set</button>
+  </div>
+  <div style="display:flex;gap:8px">
+    ${currentEx>0?`<button onclick="switchExercise(${currentEx-1})" class="btn-ghost" style="flex:1;padding:12px">← Prev</button>`:''}
+    ${currentEx<routine.exercises.length-1
+      ?`<button onclick="switchExercise(${currentEx+1})" style="flex:1;background:linear-gradient(135deg,var(--gold),var(--orange));border:none;border-radius:12px;padding:12px;color:#0d0b14;font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:.04em;cursor:pointer">Next →</button>`
+      :`<button onclick="finishWorkout()" style="flex:1;background:linear-gradient(135deg,var(--green),#43b580);border:none;border-radius:12px;padding:12px;color:#0d0b14;font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:.04em;cursor:pointer">Finish ✓</button>`}
+  </div>
+</div>`;
+}
+window.switchExercise=(i)=>{ activeWorkout.currentEx=i; renderWorkoutSession(); };
+window.updateSet=(exIdx,setIdx,field,val)=>{ activeWorkout.sets[exIdx][setIdx][field]=val; };
+window.addSet=(exIdx)=>{ activeWorkout.sets[exIdx].push({weight:"",reps:""}); renderWorkoutSession(); };
+window.removeSet=(exIdx,setIdx)=>{ if(activeWorkout.sets[exIdx].length>1){activeWorkout.sets[exIdx].splice(setIdx,1);renderWorkoutSession();} };
+window.finishWorkout=()=>{
+  const{routine,sets}=activeWorkout, dateStr=new Date().toLocaleDateString("en-AU",{day:"numeric",month:"short"});
+  routine.exercises.forEach((ex,i)=>{ const valid=sets[i].filter(s=>s.weight!==""&&s.reps!==""); if(!valid.length) return; const top=Math.max(...valid.map(s=>parseFloat(s.weight)||0)); if(!state.exerciseHistory[ex.name]) state.exerciseHistory[ex.name]=[]; state.exerciseHistory[ex.name].push({weight:top,reps:valid[0].reps,date:dateStr}); });
+  clearInterval(workoutTimer); const elapsed=Math.floor((Date.now()-activeWorkout.startTime)/1000); activeWorkout=null; saveToFirestore();
+  document.getElementById("main-content").innerHTML=`<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:70vh;gap:16px;padding:32px"><div style="font-size:60px">🏆</div><div style="font-family:'Bebas Neue',sans-serif;font-size:38px;color:var(--gold);letter-spacing:.05em">Workout Complete</div><div style="color:var(--muted);font-family:'DM Mono',monospace;font-size:14px">Duration: ${fmtTimer(elapsed)}</div><button onclick="renderFitness()" style="margin-top:16px;background:linear-gradient(135deg,var(--gold),var(--orange));border:none;border-radius:12px;padding:14px 32px;color:#0d0b14;font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:.05em;cursor:pointer">Back to Routines</button></div>`;
+};
+window.renderFitness=renderFitness;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HEALTH PAGE
+// ═══════════════════════════════════════════════════════════════════════════
+const TIME_SLOTS=[
+  {key:"morning",  label:"Morning",  icon:"🌅",start:6, end:12,urgency:11},
+  {key:"afternoon",label:"Afternoon",icon:"☀️", start:12,end:17,urgency:16},
+  {key:"evening",  label:"Evening",  icon:"🌆",start:17,end:21,urgency:20},
+  {key:"night",    label:"Night",    icon:"🌙",start:21,end:24,urgency:23},
+];
+const WATER_UNITS={
+  ml:    {label:"ml",           mlPer:1,   icon:"💧"},
+  oz:    {label:"fl oz",        mlPer:29.5,icon:"💧"},
+  glass: {label:"Glass (250ml)",mlPer:250, icon:"🥛"},
+  bottle:{label:"1L Bottle",    mlPer:1000,icon:"🍶"},
+};
+function getSuppUrgency(slot){ const h=new Date().getHours(); if(h<slot.start) return "upcoming"; if(h>=slot.end) return "past"; if(h>=slot.urgency) return "urgent"; return "active"; }
+function isSuppDone(suppId,slotKey){ return !!(state.suppChecks[todayKey()]||{})[`${suppId}_${slotKey}`]; }
+function toggleSuppCheck(suppId,slotKey){ const dk=todayKey(); if(!state.suppChecks[dk]) state.suppChecks[dk]={}; const k=`${suppId}_${slotKey}`; state.suppChecks[dk][k]=!state.suppChecks[dk][k]; saveToFirestore(); updateSuppUrgency(); }
+window.toggleSuppCheck=toggleSuppCheck;
+function updateSuppUrgency(){ TIME_SLOTS.forEach(slot=>{ const urgency=getSuppUrgency(slot); state.supplements.forEach(supp=>{ if(!supp.times.includes(slot.key)) return; const done=isSuppDone(supp.id,slot.key); const el=document.getElementById(`supp-${supp.id}-${slot.key}`); if(!el) return; let bg,border,glow; if(done){bg="#6fcf9722";border="var(--green)";glow="0 0 8px #6fcf9744";}else if(urgency==="urgent"){bg="#e07b3f22";border="#e07b3f";glow="0 0 8px #e07b3f44";}else if(urgency==="past"){bg="#ff444422";border="#ff4444";glow="0 0 6px #ff444433";}else{bg="var(--card2)";border="var(--border)";glow="none";} el.style.background=bg;el.style.borderColor=border;el.style.boxShadow=glow; }); }); }
+function waterUnitsNeeded(){ return Math.ceil(state.waterGoal/WATER_UNITS[state.waterUnit].mlPer); }
+
+// ── Health sub-tab state ──
+let healthTab = "hydration"; // "hydration" | "weight"
+
+function renderHealth(){
+  const main=document.getElementById("main-content");
+
+  if(healthTab==="weight"){
+    renderWeightPage(main);
+  } else {
+    renderHydrationPage(main);
+  }
+}
+
+function renderHydrationPage(main){
+  const wUnit=WATER_UNITS[state.waterUnit], unitsNeeded=waterUnitsNeeded(), unitsDone=state.waterLog[todayKey()]||0;
+  const mlDone=unitsDone*wUnit.mlPer, waterPct=Math.min(100,Math.round((mlDone/state.waterGoal)*100));
+  const slotSupps={}; TIME_SLOTS.forEach(s=>{slotSupps[s.key]=state.supplements.filter(sup=>sup.times.includes(s.key));});
+  main.innerHTML=`
+<div style="padding:24px 16px 100px;max-width:440px;margin:0 auto">
+  <div style="margin-bottom:16px">
+    <div style="font-family:'Bebas Neue',sans-serif;font-size:34px;color:var(--text);letter-spacing:.04em;line-height:1">Health</div>
+    <div style="font-size:12px;color:var(--dim);font-family:'DM Mono',monospace">Hydration & Supplements</div>
+  </div>
+  <!-- Sub-tab toggle -->
+  <div style="display:flex;gap:0;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:3px;margin-bottom:18px">
+    <button onclick="setHealthTab('hydration')" style="flex:1;background:${healthTab==='hydration'?'linear-gradient(135deg,#3ab4f2,#1e7fc4)':'none'};border:none;border-radius:8px;padding:7px;color:${healthTab==='hydration'?'#0d0b14':'var(--muted)'};font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:all .2s">💧 Hydration</button>
+    <button onclick="setHealthTab('weight')" style="flex:1;background:${healthTab==='weight'?'linear-gradient(135deg,var(--gold),var(--orange))':'none'};border:none;border-radius:8px;padding:7px;color:${healthTab==='weight'?'#0d0b14':'var(--muted)'};font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:all .2s">⚖️ Weight</button>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><div class="section-label" style="margin-bottom:0">Water</div><div style="font-size:11px;color:${waterPct>=100?'var(--green)':'var(--gold)'};font-family:'DM Mono',monospace">${Math.round(mlDone)} / ${state.waterGoal} ml</div></div>
+    <div style="height:8px;background:#1e1e2e;border-radius:99px;overflow:hidden;margin-bottom:16px"><div style="height:100%;width:${waterPct}%;background:${waterPct>=100?'linear-gradient(90deg,#6fcf97,#43b580)':'linear-gradient(90deg,#3ab4f2,#1e7fc4)'};border-radius:99px;transition:width .4s ease"></div></div>
+    <div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">
+      ${Object.entries(WATER_UNITS).map(([k,u])=>`<button onclick="setWaterUnit('${k}')" style="flex:1;min-width:60px;background:${state.waterUnit===k?'linear-gradient(135deg,#3ab4f2,#1e7fc4)':'var(--card2)'};border:1px solid ${state.waterUnit===k?'#3ab4f2':'var(--border)'};border-radius:8px;padding:7px 6px;color:${state.waterUnit===k?'#0d0b14':'var(--muted)'};font-family:'DM Mono',monospace;font-size:10px;cursor:pointer;line-height:1.3;text-align:center">${u.icon}<br>${u.label}</button>`).join("")}
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center"><div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;white-space:nowrap">Daily goal:</div><input id="water-goal-inp" type="number" value="${state.waterGoal}" class="inp" style="flex:1;text-align:center" placeholder="2000"/><div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace">ml</div><button onclick="saveWaterGoal()" class="btn-gold" style="padding:8px 12px;font-size:12px">Set</button></div>
+    <div style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;margin-bottom:10px;letter-spacing:.08em">TAP TO LOG — ${unitsDone}/${unitsNeeded} ${wUnit.label}</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      ${Array.from({length:unitsNeeded}).map((_,i)=>{ const filled=i<unitsDone; return `<button onclick="logWater(${i})" style="width:44px;height:54px;background:${filled?'linear-gradient(180deg,#3ab4f2,#1e7fc4)':'var(--card2)'};border:1px solid ${filled?'#3ab4f2':'var(--border)'};border-radius:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:20px;padding:0;box-shadow:${filled?'0 0 8px #3ab4f244':'none'}">${filled?wUnit.icon:`<span style="font-size:20px;opacity:.25">${wUnit.icon}</span>`}<div style="font-size:8px;font-family:DM Mono,monospace;color:${filled?'#0d0b14':'var(--faint)'}">${i+1}</div></button>`; }).join("")}
+    </div>
+    ${unitsDone>0?`<button onclick="resetWater()" style="margin-top:12px;background:none;border:none;color:var(--faint);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;text-decoration:underline">Reset today</button>`:''}
+  </div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><div class="section-label" style="margin-bottom:0">Supplements</div><button onclick="openSuppEditor()" class="btn-gold" style="font-size:13px;padding:6px 14px">+ Add</button></div>
+  ${state.supplements.length===0?`<div class="card" style="border-style:dashed;text-align:center;padding:24px 20px;margin-bottom:16px"><div style="font-size:26px;margin-bottom:8px">💊</div><div style="color:var(--faint);font-family:'DM Mono',monospace;font-size:13px">No supplements added yet</div></div>`:''}
+  ${TIME_SLOTS.map(slot=>{ const supps=slotSupps[slot.key]; if(!supps.length) return ''; const urgency=getSuppUrgency(slot); const slotColor=urgency==="urgent"?"#e07b3f":urgency==="past"?"#ff444488":urgency==="active"?"var(--gold)":"var(--dim)"; const allDone=supps.every(s=>isSuppDone(s.id,slot.key));
+    return `<div class="card" style="margin-bottom:12px;border-color:${allDone?'#6fcf9733':'var(--border2)'}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">${slot.icon}</span><span style="font-family:'Bebas Neue',sans-serif;font-size:18px;color:${slotColor};letter-spacing:.05em">${slot.label}</span><span style="font-size:10px;color:var(--dim);font-family:'DM Mono',monospace">${slot.start}:00–${slot.end}:00</span></div>
+        ${urgency==="urgent"?`<span style="font-size:10px;color:#e07b3f;font-family:'DM Mono',monospace;animation:pulse 1.5s infinite">⚠ NOW</span>`:''}
+        ${allDone?`<span style="font-size:10px;color:var(--green);font-family:'DM Mono',monospace">✓ Done</span>`:''}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${supps.map(s=>{ const done=isSuppDone(s.id,slot.key); let bg,border,glow; if(done){bg="#6fcf9722";border="var(--green)";glow="0 0 8px #6fcf9744";}else if(urgency==="urgent"){bg="#e07b3f22";border="#e07b3f";glow="0 0 8px #e07b3f44";}else if(urgency==="past"){bg="#ff444422";border="#ff4444";glow="0 0 6px #ff444433";}else{bg="var(--card2)";border="var(--border)";glow="none";} return `<div id="supp-${s.id}-${slot.key}" onclick="toggleSuppCheck('${s.id}','${slot.key}')" style="display:flex;align-items:center;gap:10px;background:${bg};border:1px solid ${border};border-radius:10px;padding:10px 13px;cursor:pointer;transition:all .3s;box-shadow:${glow}"><div style="width:18px;height:18px;border-radius:5px;border:2px solid ${done?'var(--green)':border};background:${done?'var(--green)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;color:#0d0b14">${done?'✓':''}</div><div style="flex:1"><div style="font-family:'DM Mono',monospace;font-size:13px;color:${done?'var(--dim)':'var(--text)'};text-decoration:${done?'line-through':'none'}">${s.name}</div>${s.dosage?`<div style="font-size:11px;color:var(--faint);font-family:'DM Mono',monospace">${s.dosage}</div>`:''}</div><span onclick="event.stopPropagation();removeSupp('${s.id}')" style="color:var(--faint);font-size:15px;cursor:pointer;padding:4px">×</span></div>`; }).join("")}
+      </div>
+    </div>`;
+  }).join("")}
+</div>
+<div id="supp-modal" style="display:none;position:fixed;inset:0;background:#0d0b14cc;z-index:100;align-items:flex-end;justify-content:center">
+  <div style="background:var(--bg);border:1px solid var(--border2);border-radius:20px 20px 0 0;padding:24px 20px;width:100%;max-width:480px;max-height:80vh;overflow-y:auto;box-sizing:border-box">
+    <div style="font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--gold);letter-spacing:.05em;margin-bottom:16px">Add Supplement</div>
+    <input id="supp-name" class="inp" placeholder="Name (e.g. Whey Protein)" style="width:100%;box-sizing:border-box;margin-bottom:10px"/>
+    <input id="supp-dosage" class="inp" placeholder="Dosage (e.g. 30g, 2 caps)" style="width:100%;box-sizing:border-box;margin-bottom:14px"/>
+    <div class="section-label">Take at</div>
+    <div style="display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap">
+      ${TIME_SLOTS.map(s=>`<button id="slot-btn-${s.key}" onclick="toggleSlotBtn('${s.key}')" style="flex:1;min-width:80px;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px 8px;color:var(--muted);font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;text-align:center;transition:all .2s">${s.icon} ${s.label}</button>`).join("")}
+    </div>
+    <div style="display:flex;gap:8px"><button onclick="closeSuppEditor()" class="btn-ghost" style="flex:1;padding:12px">Cancel</button><button onclick="saveSupp()" style="flex:1;background:linear-gradient(135deg,var(--gold),var(--orange));border:none;border-radius:12px;padding:12px;color:#0d0b14;font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:.04em;cursor:pointer">Save</button></div>
+  </div>
+</div>`;
+  updateSuppUrgency();
+}
+
+// ── WEIGHT TRACKING PAGE ──
+function renderWeightPage(main) {
+  const logs = state.weightLog || [];
+  const sorted = [...logs].sort((a,b)=>a.date.localeCompare(b.date));
+  const todayStr = todayKey();
+  const todayEntry = logs.find(e=>e.date===todayStr);
+
+  main.innerHTML = `
+<div style="padding:24px 16px 100px;max-width:440px;margin:0 auto">
+  <div style="margin-bottom:16px">
+    <div style="font-family:'Bebas Neue',sans-serif;font-size:34px;color:var(--text);letter-spacing:.04em;line-height:1">Health</div>
+    <div style="font-size:12px;color:var(--dim);font-family:'DM Mono',monospace">Weight Tracking</div>
+  </div>
+  <!-- Sub-tab toggle -->
+  <div style="display:flex;gap:0;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:3px;margin-bottom:18px">
+    <button onclick="setHealthTab('hydration')" style="flex:1;background:none;border:none;border-radius:8px;padding:7px;color:var(--muted);font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:all .2s">💧 Hydration</button>
+    <button onclick="setHealthTab('weight')" style="flex:1;background:linear-gradient(135deg,var(--gold),var(--orange));border:none;border-radius:8px;padding:7px;color:#0d0b14;font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:all .2s">⚖️ Weight</button>
+  </div>
+
+  <!-- Log today's weight -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="section-label">Today's Weight</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <input id="weight-inp" type="number" step="0.1" value="${todayEntry?todayEntry.weight:''}" placeholder="${useLb?'e.g. 165':'e.g. 75'}" class="inp" style="flex:1;font-size:20px;text-align:center;padding:12px"/>
+      <div style="font-size:13px;color:var(--muted);font-family:'DM Mono',monospace">${useLb?'lb':'kg'}</div>
+      <button onclick="logWeight()" class="btn-gold" style="padding:12px 18px">Log</button>
+    </div>
+    ${todayEntry?`<div style="font-size:11px;color:var(--green);font-family:'DM Mono',monospace;text-align:center">✓ Logged today: ${todayEntry.weight} ${useLb?'lb':'kg'}</div>`:'<div style="font-size:11px;color:var(--faint);font-family:\'DM Mono\',monospace;text-align:center">Log your morning weight for best consistency</div>'}
+  </div>
+
+  <!-- Stats row -->
+  ${sorted.length>=2?`
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:16px">
+    ${(()=>{
+      const first=sorted[0], last=sorted[sorted.length-1];
+      const diff=(last.weight-first.weight).toFixed(1);
+      const sign=diff>0?'+':'';
+      const min=Math.min(...sorted.map(e=>e.weight)), max=Math.max(...sorted.map(e=>e.weight));
+      const diffColor=useLb?(diff<0?'var(--green)':'var(--orange)'):(diff<0?'var(--green)':'var(--orange)');
+      return `
+        <div class="card" style="padding:12px;text-align:center">
+          <div style="font-family:'DM Mono',monospace;font-size:18px;color:${diffColor};font-weight:500">${sign}${diff}</div>
+          <div style="font-size:9px;color:var(--faint);font-family:'DM Mono',monospace;margin-top:2px">CHANGE</div>
+        </div>
+        <div class="card" style="padding:12px;text-align:center">
+          <div style="font-family:'DM Mono',monospace;font-size:18px;color:var(--green)">${min}</div>
+          <div style="font-size:9px;color:var(--faint);font-family:'DM Mono',monospace;margin-top:2px">LOWEST</div>
+        </div>
+        <div class="card" style="padding:12px;text-align:center">
+          <div style="font-family:'DM Mono',monospace;font-size:18px;color:var(--gold)">${max}</div>
+          <div style="font-size:9px;color:var(--faint);font-family:'DM Mono',monospace;margin-top:2px">HIGHEST</div>
+        </div>
+      `;
+    })()}
+  </div>
+  `:''}
+
+  <!-- Chart -->
+  ${sorted.length>=2?`
+  <div class="card" style="margin-bottom:16px;overflow:hidden">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div class="section-label" style="margin-bottom:0">Progress</div>
+      <div style="font-size:10px;color:var(--faint);font-family:'DM Mono',monospace">${sorted.length} entries</div>
+    </div>
+    <canvas id="weight-chart" height="120"></canvas>
+  </div>
+  `:sorted.length===1?`<div class="card" style="text-align:center;padding:24px;margin-bottom:16px;border-style:dashed"><div style="font-size:24px;margin-bottom:8px">📈</div><div style="color:var(--faint);font-family:'DM Mono',monospace;font-size:12px">Log one more entry to see your progress graph</div></div>`:`<div class="card" style="text-align:center;padding:24px;margin-bottom:16px;border-style:dashed"><div style="font-size:24px;margin-bottom:8px">⚖️</div><div style="color:var(--faint);font-family:'DM Mono',monospace;font-size:12px">Start logging your morning weight to track progress over time</div></div>`}
+
+  <!-- History log -->
+  ${sorted.length>0?`
+  <div class="section-label" style="margin-bottom:10px">History</div>
+  <div style="display:flex;flex-direction:column;gap:6px">
+    ${[...sorted].reverse().slice(0,30).map(entry=>`
+      <div style="display:flex;justify-content:space-between;align-items:center;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px 14px">
+        <div style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted)">${new Date(entry.date+'T12:00:00').toLocaleDateString('en-AU',{weekday:'short',day:'numeric',month:'short'})}</div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="font-family:'DM Mono',monospace;font-size:14px;color:var(--text)">${entry.weight} <span style="font-size:10px;color:var(--faint)">${useLb?'lb':'kg'}</span></div>
+          <span onclick="removeWeightEntry('${entry.date}')" style="color:var(--faint);cursor:pointer;font-size:14px;line-height:1">×</span>
+        </div>
+      </div>`).join("")}
+  </div>`:''}
+</div>`;
+
+  // Render chart after DOM update
+  if(sorted.length>=2){
+    setTimeout(()=>{
+      const canvas=document.getElementById("weight-chart"); if(!canvas) return;
+      const cid="weight-main";
+      if(chartInstances[cid]) chartInstances[cid].destroy();
+      chartInstances[cid]=new Chart(canvas,{
+        type:"line",
+        data:{
+          labels:sorted.map(e=>{ const d=new Date(e.date+'T12:00:00'); return d.toLocaleDateString('en-AU',{day:'numeric',month:'short'}); }),
+          datasets:[{
+            data:sorted.map(e=>useLb?parseFloat((e.weight*KG_TO_LB).toFixed(1)):e.weight),
+            borderColor:"#f0c972",
+            backgroundColor:"#f0c97215",
+            borderWidth:2,
+            pointBackgroundColor:"#f0c972",
+            pointRadius:3,
+            pointHoverRadius:6,
+            tension:0.3,
+            fill:true
+          }]
+        },
+        options:{
+          responsive:true,
+          plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${ctx.parsed.y} ${useLb?'lb':'kg'}`}}},
+          scales:{
+            x:{ticks:{color:"#6b6485",font:{family:"'DM Mono',monospace",size:9},maxRotation:45},grid:{color:"#1e1a30"}},
+            y:{ticks:{color:"#6b6485",font:{family:"'DM Mono',monospace",size:10},callback:v=>`${v}${useLb?'lb':'kg'}`},grid:{color:"#1e1a30"}}
+          }
+        }
+      });
+    },50);
+  }
+}
+
+window.setHealthTab=(tab)=>{ healthTab=tab; renderHealth(); };
+window.logWeight=()=>{
+  const inp=document.getElementById("weight-inp"); if(!inp) return;
+  let val=parseFloat(inp.value); if(isNaN(val)||val<=0) return;
+  // Store always in kg internally; if useLb, convert input back to kg
+  if(useLb) val=parseFloat((val/KG_TO_LB).toFixed(2));
+  else val=parseFloat(val.toFixed(2));
+  const dk=todayKey();
+  const existing=state.weightLog.findIndex(e=>e.date===dk);
+  if(existing>=0) state.weightLog[existing].weight=val;
+  else state.weightLog.push({date:dk,weight:val});
+  saveToFirestore(); renderHealth();
+};
+window.removeWeightEntry=(date)=>{
+  state.weightLog=state.weightLog.filter(e=>e.date!==date);
+  saveToFirestore(); renderHealth();
+};
+
+window.setWaterUnit=(u)=>{state.waterUnit=u;saveToFirestore();renderHealth();};
+window.saveWaterGoal=()=>{ const v=parseInt(document.getElementById("water-goal-inp").value); if(v>0){state.waterGoal=v;saveToFirestore();renderHealth();} };
+window.logWater=(i)=>{ const dk=todayKey(),cur=state.waterLog[dk]||0; state.waterLog[dk]=(i<cur)?i:i+1; saveToFirestore();renderHealth(); };
+window.resetWater=()=>{state.waterLog[todayKey()]=0;saveToFirestore();renderHealth();};
+let selectedSlots=new Set();
+window.openSuppEditor=()=>{ selectedSlots=new Set(); document.getElementById("supp-name").value=""; document.getElementById("supp-dosage").value=""; TIME_SLOTS.forEach(s=>{const b=document.getElementById(`slot-btn-${s.key}`);if(b){b.style.background="var(--card2)";b.style.borderColor="var(--border)";b.style.color="var(--muted)";}});  document.getElementById("supp-modal").style.display="flex"; };
+window.closeSuppEditor=()=>{document.getElementById("supp-modal").style.display="none";};
+window.toggleSlotBtn=(key)=>{ if(selectedSlots.has(key)){selectedSlots.delete(key);const b=document.getElementById(`slot-btn-${key}`);b.style.background="var(--card2)";b.style.borderColor="var(--border)";b.style.color="var(--muted)";}else{selectedSlots.add(key);const b=document.getElementById(`slot-btn-${key}`);b.style.background="linear-gradient(135deg,var(--gold),var(--orange))";b.style.borderColor="var(--gold)";b.style.color="#0d0b14";} };
+window.saveSupp=()=>{ const name=document.getElementById("supp-name").value.trim(); if(!name||selectedSlots.size===0) return; state.supplements.push({id:uid2(),name,dosage:document.getElementById("supp-dosage").value.trim(),times:[...selectedSlots]}); saveToFirestore();closeSuppEditor();renderHealth(); };
+window.removeSupp=(id)=>{state.supplements=state.supplements.filter(s=>s.id!==id);saveToFirestore();renderHealth();};
+window.renderHealth=renderHealth;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GOOGLE CALENDAR
+// ═══════════════════════════════════════════════════════════════════════════
+const GCAL_CLIENT_ID="124339449156-61291qfr8vbktbsqj7rk5qq7qq5nsohg.apps.googleusercontent.com";
+const GCAL_SCOPE="https://www.googleapis.com/auth/calendar.readonly";
+let gcalAccessToken=null, gcalEvents=[], gcalLoading=false, gcalError=null, gcalTokenClient=null, gsiLoaded=false;
+
+function loadGSI(){
+  if(gsiLoaded) return; gsiLoaded=true;
+  const s=document.createElement("script"); s.src="https://accounts.google.com/gsi/client"; s.async=true; s.defer=true;
+  s.onload=()=>{
+    gcalTokenClient=google.accounts.oauth2.initTokenClient({
+      client_id:GCAL_CLIENT_ID, scope:GCAL_SCOPE,
+      callback:async(resp)=>{ if(resp.error){gcalError="Access denied";gcalLoading=false;renderCurrentTab();return;} gcalAccessToken=resp.access_token;gcalError=null;await fetchGCalEvents(); }
+    });
+  };
+  document.head.appendChild(s);
+}
+
+async function fetchGCalEvents(){
+  gcalLoading=true; gcalError=null; renderCurrentTab();
+  try{
+    const now=new Date(), s=new Date(now.getFullYear(),now.getMonth(),now.getDate()).toISOString(), e=new Date(now.getFullYear(),now.getMonth(),now.getDate(),23,59,59).toISOString();
+    const url=`https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(s)}&timeMax=${encodeURIComponent(e)}&singleEvents=true&orderBy=startTime&maxResults=50`;
+    const res=await fetch(url,{headers:{Authorization:`Bearer ${gcalAccessToken}`}});
+    if(!res.ok){ if(res.status===401){gcalAccessToken=null;gcalError="Session expired — reconnect";}else{gcalError=`Error ${res.status}`;} gcalLoading=false;renderCurrentTab();return; }
+    const data=await res.json();
+    gcalEvents=(data.items||[]).sort((a,b)=>(a.start?.dateTime||a.start?.date||"").localeCompare(b.start?.dateTime||b.start?.date||""));
+  }catch(e){gcalError="Network error";}
+  gcalLoading=false; renderCurrentTab();
+}
+
+async function fetchGCalEventsForRange(timeMin, timeMax){
+  if(!gcalAccessToken) return [];
+  try{
+    const url=`https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}&singleEvents=true&orderBy=startTime&maxResults=200`;
+    const res=await fetch(url,{headers:{Authorization:`Bearer ${gcalAccessToken}`}});
+    if(!res.ok) return [];
+    const data=await res.json();
+    return data.items||[];
+  }catch(e){ return []; }
+}
+
+window.gcalConnect=()=>{ if(!gcalTokenClient){gcalError="Still loading, retry in a second";renderCurrentTab();return;} gcalTokenClient.requestAccessToken({prompt:""}); };
+window.gcalDisconnect=()=>{ if(gcalAccessToken) google.accounts.oauth2.revoke(gcalAccessToken); gcalAccessToken=null;gcalEvents=[];gcalError=null;calRangeEvents={};renderCurrentTab(); };
+window.gcalRefresh=async()=>{ if(!gcalAccessToken){window.gcalConnect();return;} await fetchGCalEvents(); };
+
+function fmtEventTime(ev){ if(ev.start?.dateTime){ const s=new Date(ev.start.dateTime),e=new Date(ev.end.dateTime),fmt=d=>d.toLocaleTimeString("en-AU",{hour:"2-digit",minute:"2-digit"}); return `${fmt(s)} – ${fmt(e)}`; } return "All day"; }
+function isEventNow(ev){ if(!ev.start?.dateTime) return false; const now=Date.now(); return now>=new Date(ev.start.dateTime).getTime()&&now<=new Date(ev.end.dateTime).getTime(); }
+function isEventPast(ev){ if(!ev.start?.dateTime) return false; return Date.now()>new Date(ev.end.dateTime).getTime(); }
+
+function buildTodaySchedule(){
+  const items=[];
+  gcalEvents.forEach(ev=>items.push({type:"event",ev,sortKey:ev.start?.dateTime||ev.start?.date||"0000"}));
+  state.todayGoals.forEach(g=>items.push({type:"goal",goal:g,sortKey:"anytime"}));
+  const slotTimes={morning:"06:00",afternoon:"12:00",evening:"17:00",night:"21:00"};
+  TIME_SLOTS.forEach(slot=>{ const supps=state.supplements.filter(s=>s.times.includes(slot.key)); if(supps.length) items.push({type:"supps",slot,supps,sortKey:`${todayKey()}T${slotTimes[slot.key]}`}); });
+  items.sort((a,b)=>{ if(a.sortKey==="anytime"&&b.sortKey!=="anytime") return -1; if(b.sortKey==="anytime"&&a.sortKey!=="anytime") return 1; return a.sortKey.localeCompare(b.sortKey); });
+  return items;
+}
+
+function renderScheduleItem(item, context){
+  if(item.type==="event"){
+    const ev=item.ev, now2=isEventNow(ev), past=isEventPast(ev), allDay=!ev.start?.dateTime;
+    const color=now2?"var(--gold)":past?"var(--faint)":"var(--purple)", borderCol=now2?"var(--gold)":past?"var(--border)":"var(--purple)";
+    return `<div style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;background:${now2?'#f0c97210':'var(--card2)'};border:1px solid ${borderCol};border-radius:12px;opacity:${past?'0.5':'1'}">
+      <div style="min-width:54px;text-align:right;padding-top:1px"><div style="font-size:10px;font-family:'DM Mono',monospace;color:${color};line-height:1.5">${fmtEventTime(ev)}</div>${now2?`<div style="font-size:9px;color:var(--gold);font-family:'DM Mono',monospace;animation:pulse 1.5s infinite">● NOW</div>`:''}</div>
+      <div style="flex:1;min-width:0"><div style="font-family:'DM Mono',monospace;font-size:13px;color:${past?'var(--dim)':'var(--text)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${ev.summary||'(No title)'}</div>${ev.location?`<div style="font-size:10px;color:var(--faint);font-family:'DM Mono',monospace;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📍 ${ev.location}</div>`:''}${allDay?`<div style="font-size:9px;color:var(--purple);font-family:'DM Mono',monospace;margin-top:2px">ALL DAY</div>`:''}</div>
+      <div style="width:3px;border-radius:2px;background:${color};align-self:stretch;min-height:20px;flex-shrink:0"></div>
+    </div>`;
+  }
+  if(item.type==="goal"){
+    const g=item.goal, ctx=context;
+    return `<div onclick="${ctx==='home'?`toggleGoal('${g.id}')`:`calToggleGoal('${g.id}')`}" style="display:flex;gap:10px;align-items:center;padding:9px 12px;background:var(--card2);border:1px solid ${g.done?'#6fcf9733':'var(--border)'};border-radius:12px;cursor:pointer;opacity:${g.done?'0.55':'1'}">
+      <div style="min-width:54px;text-align:right"><div style="font-size:9px;font-family:'DM Mono',monospace;color:var(--faint)">GOAL</div></div>
+      <div style="width:15px;height:15px;border-radius:4px;border:2px solid ${g.done?'var(--green)':'var(--faint)'};background:${g.done?'var(--green)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:900;color:#0d0b14">${g.done?'✓':''}</div>
+      <div style="flex:1;font-family:'DM Mono',monospace;font-size:13px;color:${g.done?'var(--dim)':'var(--text)'};text-decoration:${g.done?'line-through':'none'}">${g.text}</div>
+      <div style="width:3px;border-radius:2px;background:var(--green);align-self:stretch;min-height:20px;flex-shrink:0"></div>
+    </div>`;
+  }
+  if(item.type==="supps"){
+    const{slot,supps}=item, urgency=getSuppUrgency(slot), allDone=supps.every(s=>isSuppDone(s.id,slot.key));
+    const slotColor=urgency==="urgent"?"#e07b3f":urgency==="past"?"var(--faint)":urgency==="active"?"var(--gold)":"var(--dim)";
+    return `<div style="padding:9px 12px;background:var(--card2);border:1px solid ${allDone?'#6fcf9733':'var(--border)'};border-radius:12px;opacity:${urgency==='past'&&allDone?'0.5':'1'}">
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:${supps.length>1?'7px':'0'}">
+        <div style="min-width:54px;text-align:right"><div style="font-size:10px;font-family:'DM Mono',monospace;color:${slotColor}">${slot.start}:00</div></div>
+        <span style="font-size:13px">${slot.icon}</span>
+        <div style="flex:1;font-family:'Bebas Neue',sans-serif;font-size:14px;color:${slotColor};letter-spacing:.05em">${slot.label} Supps</div>
+        ${urgency==="urgent"?`<span style="font-size:9px;color:#e07b3f;font-family:'DM Mono',monospace;animation:pulse 1.5s infinite">⚠ NOW</span>`:''}
+        ${allDone?`<span style="font-size:9px;color:var(--green);font-family:'DM Mono',monospace">✓</span>`:''}
+        <div style="width:3px;border-radius:2px;background:${slotColor};align-self:stretch;min-height:20px;flex-shrink:0"></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px;padding-left:64px">
+        ${supps.map(s=>{ const done=isSuppDone(s.id,slot.key); const toggleFn=context==='home'?`toggleSuppCheck('${s.id}','${slot.key}')`:`calToggleSupp('${s.id}','${slot.key}')`; return `<div onclick="${toggleFn}" style="display:flex;align-items:center;gap:7px;cursor:pointer"><div style="width:13px;height:13px;border-radius:3px;border:2px solid ${done?'var(--green)':'var(--faint)'};background:${done?'var(--green)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:900;color:#0d0b14">${done?'✓':''}</div><span style="font-family:'DM Mono',monospace;font-size:12px;color:${done?'var(--dim)':'var(--text)'};text-decoration:${done?'line-through':'none'}">${s.name}${s.dosage?` <span style="color:var(--faint);font-size:10px">${s.dosage}</span>`:''}</span></div>`; }).join("")}
+      </div>
+    </div>`;
+  }
+  return "";
+}
+
+window.calToggleGoal=(id)=>{ const g=state.todayGoals.find(x=>x.id===id); if(g){g.done=!g.done;saveToFirestore();renderCalendar();} };
+window.calToggleSupp=(suppId,slotKey)=>{ toggleSuppCheck(suppId,slotKey); renderCalendar(); };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALENDAR PAGE
+// ═══════════════════════════════════════════════════════════════════════════
+let calView="week", calOffset=0, calRangeEvents={}, calShowGoals=true, calShowSupps=true, calSelectedDay=null;
+
+function getWeekDays(offset){
+  const now=new Date(), dow=now.getDay(), monday=new Date(now);
+  monday.setDate(now.getDate()-((dow+6)%7)+offset*7);
+  return Array.from({length:7},(_,i)=>{ const d=new Date(monday); d.setDate(monday.getDate()+i); return d; });
+}
+function getMonthDays(offset){
+  const now=new Date(), y=now.getFullYear(), m=now.getMonth()+offset;
+  const first=new Date(y,m,1), last=new Date(y,m+1,0);
+  const startDow=(first.getDay()+6)%7;
+  const days=[];
+  for(let i=0;i<startDow;i++) days.push(null);
+  for(let d=1;d<=last.getDate();d++) days.push(new Date(y,m,d));
+  while(days.length%7!==0) days.push(null);
+  return days;
+}
+function dateKey(d){ return d.toISOString().slice(0,10); }
+
+async function loadCalRangeEvents(days){
+  if(!gcalAccessToken) return;
+  const realDays=days.filter(Boolean); if(!realDays.length) return;
+  const min=new Date(realDays[0]); min.setHours(0,0,0,0);
+  const max=new Date(realDays[realDays.length-1]); max.setHours(23,59,59,999);
+  const evts=await fetchGCalEventsForRange(min.toISOString(),max.toISOString());
+  calRangeEvents={};
+  evts.forEach(ev=>{ const dk=(ev.start?.dateTime||ev.start?.date||"").slice(0,10); if(!calRangeEvents[dk]) calRangeEvents[dk]=[]; calRangeEvents[dk].push(ev); });
+  renderCalendar();
+}
+
+async function renderCalendar(){
+  loadGSI();
+  const main=document.getElementById("main-content"); if(!main) return;
+  const todayStr=todayKey();
+  const days=calView==="week"?getWeekDays(calOffset):getMonthDays(calOffset);
+  if(gcalAccessToken && Object.keys(calRangeEvents).length===0) loadCalRangeEvents(days.filter(Boolean));
+
+  let periodLabel="";
+  if(calView==="week"){
+    const realDays=days.filter(Boolean);
+    const s=realDays[0].toLocaleDateString("en-AU",{day:"numeric",month:"short"});
+    const e=realDays[6].toLocaleDateString("en-AU",{day:"numeric",month:"short",year:"numeric"});
+    periodLabel=`${s} – ${e}`;
+  } else {
+    const now=new Date(), ref=new Date(now.getFullYear(),now.getMonth()+calOffset,1);
+    periodLabel=ref.toLocaleDateString("en-AU",{month:"long",year:"numeric"});
+  }
+
+  main.innerHTML=`
+<div style="padding:16px 16px 100px;max-width:440px;margin:0 auto">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+    <div style="font-family:'Bebas Neue',sans-serif;font-size:30px;color:var(--text);letter-spacing:.04em;line-height:1">Calendar</div>
+    <div style="display:flex;gap:6px;align-items:center">
+      ${gcalAccessToken?`<button onclick="reloadCal()" style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:5px 9px;color:var(--muted);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer">↻</button>`:`<button onclick="gcalConnect()" style="background:linear-gradient(135deg,#4285F4,#1a6fd4);border:none;border-radius:8px;padding:6px 12px;color:#fff;font-family:'DM Mono',monospace;font-size:11px;cursor:pointer">+ Connect</button>`}
+    </div>
+  </div>
+  <div style="display:flex;gap:0;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:3px;margin-bottom:14px">
+    <button onclick="setCalView('week')" style="flex:1;background:${calView==='week'?'linear-gradient(135deg,var(--gold),var(--orange))':'none'};border:none;border-radius:8px;padding:7px;color:${calView==='week'?'#0d0b14':'var(--muted)'};font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:all .2s">Week</button>
+    <button onclick="setCalView('month')" style="flex:1;background:${calView==='month'?'linear-gradient(135deg,var(--gold),var(--orange))':'none'};border:none;border-radius:8px;padding:7px;color:${calView==='month'?'#0d0b14':'var(--muted)'};font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:all .2s">Month</button>
+  </div>
+  <div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">
+    <button onclick="toggleCalGoals()" style="flex:1;background:${calShowGoals?'#6fcf9733':'var(--card2)'};border:1px solid ${calShowGoals?'var(--green)':'var(--border)'};border-radius:8px;padding:6px 10px;color:${calShowGoals?'var(--green)':'var(--faint)'};font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;transition:all .2s">✓ Goals</button>
+    <button onclick="toggleCalSupps()" style="flex:1;background:${calShowSupps?'#f0c97222':'var(--card2)'};border:1px solid ${calShowSupps?'var(--gold)':'var(--border)'};border-radius:8px;padding:6px 10px;color:${calShowSupps?'var(--gold)':'var(--faint)'};font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;transition:all .2s">💊 Supps</button>
+  </div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <button onclick="calNav(-1)" style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;color:var(--muted);font-family:'DM Mono',monospace;font-size:13px;cursor:pointer">‹</button>
+    <div style="font-family:'DM Mono',monospace;font-size:12px;color:var(--text);text-align:center">${periodLabel}</div>
+    <button onclick="calNav(1)" style="background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;color:var(--muted);font-family:'DM Mono',monospace;font-size:13px;cursor:pointer">›</button>
+  </div>
+  ${calOffset!==0?`<div style="text-align:center;margin-bottom:10px"><button onclick="calGoToday()" style="background:none;border:none;color:var(--gold);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;text-decoration:underline">Back to today</button></div>`:''}
+  <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px;margin-bottom:4px">
+    ${['M','T','W','T','F','S','S'].map(d=>`<div style="text-align:center;font-size:10px;font-family:'DM Mono',monospace;color:var(--faint);padding:2px 0">${d}</div>`).join("")}
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px;margin-bottom:16px">
+    ${days.map(d=>{
+      if(!d) return `<div></div>`;
+      const dk=dateKey(d), isToday=dk===todayStr, isSelected=dk===calSelectedDay;
+      const evts=calRangeEvents[dk]||[];
+      const hasGoals=calShowGoals&&dk===todayStr&&state.todayGoals.length>0;
+      const hasSupps=calShowSupps&&state.supplements.length>0;
+      const isSun=(d.getDay()===0), isSat=(d.getDay()===6);
+      return `<div onclick="calSelectDay('${dk}')" style="background:${isSelected?'linear-gradient(135deg,var(--gold),var(--orange))':isToday?'#f0c97222':'var(--card2)'};border:1px solid ${isSelected?'var(--gold)':isToday?'var(--gold)':'var(--border)'};border-radius:8px;padding:6px 4px 5px;text-align:center;cursor:pointer;min-height:52px;display:flex;flex-direction:column;align-items:center;gap:3px;transition:all .15s">
+        <div style="font-family:'DM Mono',monospace;font-size:12px;font-weight:500;color:${isSelected?'#0d0b14':isToday?'var(--gold)':isSun||isSat?'var(--muted)':'var(--text)'}">${d.getDate()}</div>
+        <div style="display:flex;gap:2px;flex-wrap:wrap;justify-content:center;min-height:8px">
+          ${evts.slice(0,2).map(()=>`<div style="width:5px;height:5px;border-radius:50%;background:var(--purple);flex-shrink:0"></div>`).join("")}
+          ${hasGoals?`<div style="width:5px;height:5px;border-radius:50%;background:var(--green);flex-shrink:0"></div>`:''}
+          ${hasSupps&&dk===todayStr?`<div style="width:5px;height:5px;border-radius:50%;background:var(--gold);flex-shrink:0"></div>`:''}
+          ${evts.length>2?`<div style="font-size:7px;color:var(--faint);font-family:'DM Mono',monospace;line-height:5px">+${evts.length-2}</div>`:''}
+        </div>
+      </div>`;
+    }).join("")}
+  </div>
+  ${calSelectedDay ? renderDayDetail(calSelectedDay) : `<div style="text-align:center;padding:16px 0;font-family:'DM Mono',monospace;font-size:12px;color:var(--faint)">Tap a day to see details</div>`}
+</div>`;
+}
+
+function renderDayDetail(dk){
+  const d=new Date(dk+"T12:00:00");
+  const label=d.toLocaleDateString("en-AU",{weekday:"long",day:"numeric",month:"long"});
+  const evts=calRangeEvents[dk]||[];
+  const isToday=dk===todayKey();
+  let items=[];
+  evts.forEach(ev=>items.push({type:"event",ev,sortKey:ev.start?.dateTime||ev.start?.date||"0000"}));
+  if(calShowGoals&&isToday) state.todayGoals.forEach(g=>items.push({type:"goal",goal:g,sortKey:"anytime"}));
+  if(calShowSupps&&isToday){
+    const slotTimes={morning:"06:00",afternoon:"12:00",evening:"17:00",night:"21:00"};
+    TIME_SLOTS.forEach(slot=>{ const supps=state.supplements.filter(s=>s.times.includes(slot.key)); if(supps.length) items.push({type:"supps",slot,supps,sortKey:`${dk}T${slotTimes[slot.key]}`}); });
+  }
+  items.sort((a,b)=>{ if(a.sortKey==="anytime"&&b.sortKey!=="anytime") return -1; if(b.sortKey==="anytime"&&a.sortKey!=="anytime") return 1; return a.sortKey.localeCompare(b.sortKey); });
+  return `
+  <div style="border-top:1px solid var(--border);padding-top:16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div style="font-family:'DM Mono',monospace;font-size:12px;color:var(--text)">${label}</div>
+      <button onclick="calSelectedDay=null;renderCalendar()" style="background:none;border:none;color:var(--faint);font-size:18px;cursor:pointer;line-height:1">×</button>
+    </div>
+    ${items.length===0?`<div style="text-align:center;padding:16px 0;color:var(--faint);font-family:'DM Mono',monospace;font-size:12px">Nothing scheduled</div>`:''}
+    <div style="display:flex;flex-direction:column;gap:7px">
+      ${items.map(item=>renderScheduleItem(item,'calendar')).join("")}
+    </div>
+  </div>`;
+}
+
+window.setCalView=(v)=>{ calView=v; calOffset=0; calRangeEvents={}; renderCalendar(); };
+window.calNav=(dir)=>{ calOffset+=dir; calRangeEvents={}; renderCalendar(); loadCalRangeEvents(calView==="week"?getWeekDays(calOffset).filter(Boolean):getMonthDays(calOffset).filter(Boolean)); };
+window.calGoToday=()=>{ calOffset=0; calRangeEvents={}; renderCalendar(); };
+window.calSelectDay=(dk)=>{ calSelectedDay=calSelectedDay===dk?null:dk; renderCalendar(); };
+window.toggleCalGoals=()=>{ calShowGoals=!calShowGoals; renderCalendar(); };
+window.toggleCalSupps=()=>{ calShowSupps=!calShowSupps; renderCalendar(); };
+window.reloadCal=()=>{ calRangeEvents={}; const days=calView==="week"?getWeekDays(calOffset):getMonthDays(calOffset); loadCalRangeEvents(days.filter(Boolean)); };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AI FITNESS COACH — FLOATING BUTTON + CHAT MODAL (Anthropic API)
+// ═══════════════════════════════════════════════════════════════════════════
+(function(){
+  // ── Styles ──
+  const style = document.createElement('style');
+  style.innerHTML = `
+    #coach-fab {
+      position: fixed;
+      bottom: 80px;
+      left: 16px;
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #f0c972, #e07b3f);
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      box-shadow: 0 4px 20px #f0c97244;
+      z-index: 60;
+      transition: transform .2s, box-shadow .2s;
+    }
+    #coach-fab:hover { transform: scale(1.08); box-shadow: 0 6px 28px #f0c97266; }
+    #coach-fab.open { background: linear-gradient(135deg, #9180c4, #5a4a8a); box-shadow: 0 4px 20px #9180c444; }
+    #coach-modal {
+      position: fixed;
+      bottom: 140px;
+      left: 12px;
+      right: 12px;
+      max-width: 440px;
+      max-height: 70vh;
+      background: var(--bg);
+      border: 1px solid var(--border2);
+      border-radius: 18px;
+      z-index: 59;
+      display: none;
+      flex-direction: column;
+      box-shadow: 0 8px 40px #0d0b14cc;
+      overflow: hidden;
+    }
+    #coach-modal.visible { display: flex; }
+    #coach-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #coach-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      scroll-behavior: smooth;
+    }
+    .coach-msg {
+      max-width: 90%;
+      padding: 9px 12px;
+      border-radius: 12px;
+      font-family: 'DM Mono', monospace;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .coach-msg.user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, #f0c97233, #e07b3f22);
+      border: 1px solid var(--gold);
+      color: var(--text);
+      border-bottom-right-radius: 4px;
+    }
+    .coach-msg.ai {
+      align-self: flex-start;
+      background: var(--card2);
+      border: 1px solid var(--border2);
+      color: var(--text);
+      border-bottom-left-radius: 4px;
+    }
+    .coach-msg.ai.loading { color: var(--faint); font-style: italic; }
+    #coach-image-preview {
+      padding: 8px 14px 0;
+      display: none;
+    }
+    #coach-image-preview img {
+      height: 56px;
+      border-radius: 8px;
+      border: 1px solid var(--border2);
+    }
+    #coach-input-row {
+      display: flex;
+      gap: 8px;
+      padding: 10px 12px 12px;
+      border-top: 1px solid var(--border);
+      align-items: flex-end;
+      flex-shrink: 0;
+    }
+    #coach-text {
+      flex: 1;
+      background: var(--card2);
+      border: 1px solid var(--border2);
+      border-radius: 10px;
+      padding: 9px 11px;
+      color: var(--text);
+      font-family: 'DM Mono', monospace;
+      font-size: 12px;
+      outline: none;
+      resize: none;
+      max-height: 80px;
+      overflow-y: auto;
+    }
+    #coach-text::placeholder { color: var(--faint); }
+    #coach-img-btn {
+      background: var(--card2);
+      border: 1px solid var(--border2);
+      border-radius: 10px;
+      padding: 9px 10px;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    #coach-img-btn:hover { border-color: var(--gold); color: var(--gold); }
+    #coach-send {
+      background: linear-gradient(135deg, var(--gold), var(--orange));
+      border: none;
+      border-radius: 10px;
+      padding: 9px 14px;
+      color: #0d0b14;
+      font-family: 'DM Mono', monospace;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    #coach-send:disabled { opacity: 0.4; cursor: default; }
+  `;
+  document.head.appendChild(style);
+
+  // ── DOM ──
+  const fab = document.createElement('button');
+  fab.id = 'coach-fab';
+  fab.textContent = '🤖';
+  fab.title = 'AI Fitness Coach';
+
+  const modal = document.createElement('div');
+  modal.id = 'coach-modal';
+  modal.innerHTML = `
+    <div id="coach-header">
+      <div style="font-size:20px">🤖</div>
+      <div style="flex:1">
+        <div style="font-family:'Bebas Neue',sans-serif;font-size:18px;color:var(--gold);letter-spacing:.04em">AI Fitness Coach</div>
+        <div style="font-size:10px;color:var(--faint);font-family:'DM Mono',monospace">Powered by Claude · Your personal trainer</div>
+      </div>
+      <button onclick="coachClear()" style="background:none;border:none;color:var(--faint);font-family:'DM Mono',monospace;font-size:10px;cursor:pointer;padding:4px 6px">Clear</button>
+    </div>
+    <div id="coach-messages"></div>
+    <div id="coach-image-preview">
+      <div style="display:flex;align-items:center;gap:8px">
+        <img id="coach-img-thumb" src="" alt=""/>
+        <button onclick="coachRemoveImage()" style="background:none;border:none;color:var(--faint);font-size:18px;cursor:pointer">×</button>
+        <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--faint)">Image attached</span>
+      </div>
+    </div>
+    <div id="coach-input-row">
+      <textarea id="coach-text" placeholder="Ask your coach anything…" rows="1" onkeydown="coachKeydown(event)"></textarea>
+      <button id="coach-img-btn" onclick="document.getElementById('coach-file').click()" title="Attach image">📷</button>
+      <input id="coach-file" type="file" accept="image/*" style="display:none" onchange="coachImageSelected(this)"/>
+      <button id="coach-send" onclick="coachSend()">Send</button>
+    </div>
+  `;
+
+  document.body.appendChild(fab);
+  document.body.appendChild(modal);
+
+  // ── State ──
+  let coachOpen = false;
+  let coachMessages = []; // {role, content (text or array)}
+  let coachImageB64 = null;
+  let coachImageMime = null;
+  let coachIsLoading = false;
+
+  // ── System prompt ──
+  function buildSystemPrompt(){
+    const weightUnit = (typeof useLb !== 'undefined' && useLb) ? 'lb' : 'kg';
+    const routinesSummary = (typeof state !== 'undefined' && state.routines?.length)
+      ? state.routines.map(r=>`${r.name}: ${r.exercises.map(e=>e.name).join(', ')}`).join('\n')
+      : 'No routines yet';
+    const histSummary = (typeof state !== 'undefined' && state.exerciseHistory)
+      ? Object.entries(state.exerciseHistory).slice(0,8).map(([name,sessions])=>{
+          const last = sessions[sessions.length-1];
+          return last ? `${name}: last ${last.weight}${weightUnit} x ${last.reps} reps (${sessions.length} sessions)` : '';
+        }).filter(Boolean).join('\n')
+      : 'No history yet';
+    const suppsSummary = (typeof state !== 'undefined' && state.supplements?.length)
+      ? state.supplements.map(s=>`${s.name}${s.dosage?' '+s.dosage:''} (${s.times.join(', ')})`).join(', ')
+      : 'None';
+    const weightHistory = (typeof state !== 'undefined' && state.weightLog?.length)
+      ? [...state.weightLog].sort((a,b)=>a.date.localeCompare(b.date)).slice(-10)
+          .map(e=>`${e.date}: ${e.weight}${weightUnit}`).join(', ')
+      : 'No weight data yet';
+    const goals = (typeof state !== 'undefined' && state.todayGoals?.length)
+      ? state.todayGoals.map(g=>`${g.done?'✓':'-'} ${g.text}`).join(', ')
+      : 'None set';
+
+    return `You are a professional fitness coach embedded in a personal life dashboard app. Be concise, practical, and encouraging. Keep responses under 120 words unless the user asks for detail. Use bullet points for lists. Never waffle.
+
+USER CONTEXT:
+- Routines: ${routinesSummary}
+- Recent exercise history: ${histSummary}
+- Supplements: ${suppsSummary}
+- Weight log (last 10): ${weightHistory}
+- Today's goals: ${goals}
+- Weight unit: ${weightUnit}
+
+When analysing progress photos, give honest, actionable feedback on physique, form, or posture. When asked about nutrition or supplementation, give evidence-based advice tailored to their data. Always connect advice back to their actual data where relevant.`;
+  }
+
+  // ── Toggle ──
+  fab.addEventListener('click', ()=>{
+    coachOpen = !coachOpen;
+    modal.classList.toggle('visible', coachOpen);
+    fab.classList.toggle('open', coachOpen);
+    if(coachOpen && coachMessages.length===0) coachGreet();
+  });
+
+  function coachGreet(){
+    const hour = new Date().getHours();
+    const greeting = hour<12?'Morning':'Evening';
+    const hasHistory = typeof state !== 'undefined' && Object.keys(state.exerciseHistory||{}).length > 0;
+    const msg = hasHistory
+      ? `${greeting}! I've reviewed your training data. Ask me about progressive overload, nutrition, recovery, or upload a progress photo for physique feedback.`
+      : `${greeting}! I'm your AI fitness coach. Once you log some workouts I can analyse your progress. For now, ask me anything about training or nutrition.`;
+    appendMessage('ai', msg);
+  }
+
+  function appendMessage(role, text){
+    coachMessages.push({role, text});
+    renderMessages();
+  }
+
+  function renderMessages(){
+    const container = document.getElementById('coach-messages');
+    if(!container) return;
+    container.innerHTML = coachMessages.map(m=>`
+      <div class="coach-msg ${m.role==='user'?'user':'ai'}${m.loading?' loading':''}">
+        ${m.text.replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<b>$1</b>').replace(/^• /gm,'• ')}
+      </div>
+    `).join('');
+    container.scrollTop = container.scrollHeight;
+  }
+
+  window.coachSend = async function(){
+    if(coachIsLoading) return;
+  const textEl = document.getElementById('coach-text');
+  const text = textEl?.value.trim();
+  if(!text && !coachImageB64) return;
+
+  appendMessage('user', text || '📷 [Image attached]');
+  textEl.value = '';
+
+  const currentImgB64 = coachImageB64;
+  const currentImgMime = coachImageMime;
+  coachRemoveImage();
+
+  const loadingMsg = {role:'ai', text:'Thinking…', loading:true};
+  coachMessages.push(loadingMsg);
+  renderMessages();
+  coachIsLoading = true;
+  document.getElementById('coach-send').disabled = true;
+
+  try {
+    // Build messages array
+    const messages = coachMessages.slice(0,-1)
+      .filter(m=>!m.loading)
+      .map(m=>({role: m.role, content: m.text}));
+
+    // Add current message
+    messages.push({role: "user", content: text});
+
+    // Call your Vercel endpoint (now uses Gemini)
+    const response = await fetch('/api/coach.js', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: messages,
+        systemPrompt: buildSystemPrompt()
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || `API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    coachMessages.pop();
+    coachMessages.push({role:'ai', text: data.reply});
+    renderMessages();
+
+  } catch(err) {
+    console.error(err);
+    coachMessages.pop();
+    coachMessages.push({role:'ai', text:`Error: ${err.message}`});
+    renderMessages();
+  }
+
+  coachIsLoading = false;
+  const sendBtn = document.getElementById('coach-send');
+  if(sendBtn) sendBtn.disabled = false;
+};
+
+  window.coachKeydown = function(e){
+    if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); coachSend(); }
+  };
+
+  window.coachImageSelected = function(input){
+    const file = input.files[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev)=>{
+      const result = ev.target.result;
+      coachImageB64 = result.split(',')[1];
+      coachImageMime = file.type;
+      const preview = document.getElementById('coach-image-preview');
+      const thumb = document.getElementById('coach-img-thumb');
+      if(preview && thumb){ thumb.src=result; preview.style.display='block'; }
+    };
+    reader.readAsDataURL(file);
+    input.value='';
+  };
+
+  window.coachRemoveImage = function(){
+    coachImageB64 = null; coachImageMime = null;
+    const preview = document.getElementById('coach-image-preview');
+    if(preview) preview.style.display='none';
+  };
+
+  window.coachClear = function(){
+    coachMessages = [];
+    renderMessages();
+    coachGreet();
+  };
+
+})();
+
+</script>
+
+<style>
+  :root {
+    --bg:#0d0b14; --card:#13111f; --card2:#17142a; --card-darker:#111020;
+    --border:#221d35; --border2:#2a2440;
+    --gold:#f0c972; --orange:#e07b3f; --green:#6fcf97; --purple:#9180c4;
+    --text:#e8e3f8; --muted:#9991b8; --dim:#6b6485; --faint:#3d3657;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); min-height:100vh; overflow-x:hidden; }
+  .card { background:var(--card); border:1px solid var(--border2); border-radius:14px; padding:18px 18px 16px; }
+  .section-label { font-size:11px; letter-spacing:.12em; color:var(--dim); text-transform:uppercase; font-family:'DM Mono',monospace; margin-bottom:12px; }
+  .inp { background:var(--card2); border:1px solid var(--border2); border-radius:8px; padding:9px 12px; color:var(--text); font-family:'DM Mono',monospace; font-size:13px; outline:none; }
+  .inp::placeholder { color:var(--faint); }
+  .btn-gold   { background:linear-gradient(135deg,var(--gold),var(--orange)); border:none; border-radius:8px; padding:9px 16px; color:#0d0b14; font-weight:700; font-family:'DM Mono',monospace; font-size:14px; cursor:pointer; }
+  .btn-purple { background:linear-gradient(135deg,var(--purple),#5a4a8a); border:none; border-radius:8px; padding:9px 16px; color:#0d0b14; font-weight:700; font-family:'DM Mono',monospace; font-size:14px; cursor:pointer; }
+  .btn-ghost  { background:var(--card2); border:1px solid var(--border); border-radius:12px; padding:10px 14px; color:var(--muted); font-family:'DM Mono',monospace; font-size:13px; cursor:pointer; }
+  .goal-row { display:flex; align-items:center; gap:10px; background:#1e1a30; border-radius:10px; padding:9px 12px; border:1px solid var(--border); transition:border .3s; }
+  .goal-row.done { border-color:#6fcf9733; }
+  .checkbox { width:17px; height:17px; border-radius:4px; border:2px solid var(--faint); background:transparent; cursor:pointer; flex-shrink:0; display:flex; align-items:center; justify-content:center; transition:all .2s; font-size:10px; font-weight:900; color:#17132a; }
+  .checkbox.checked { border-color:var(--green); background:var(--green); }
+  #tab-bar { position:fixed; bottom:0; left:0; right:0; background:#0d0b14ee; border-top:1px solid var(--border); display:flex; backdrop-filter:blur(12px); z-index:50; }
+  .tab-btn { flex:1; background:none; border:none; border-top:2px solid transparent; display:flex; flex-direction:column; align-items:center; gap:3px; padding:10px 0; cursor:pointer; color:var(--faint); font-family:'DM Mono',monospace; font-size:10px; letter-spacing:.08em; text-transform:uppercase; transition:all .2s; }
+  .tab-btn.active { color:var(--gold); border-top-color:var(--gold); }
+  .tab-btn span { font-size:18px; }
+  #auth-screen { position:fixed; inset:0; background:var(--bg); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; z-index:200; }
+  #user-bar { display:flex; align-items:center; justify-content:flex-end; gap:10px; padding:12px 16px 0; max-width:440px; margin:0 auto; }
+  #user-avatar { width:28px; height:28px; border-radius:99px; background:linear-gradient(135deg,var(--gold),var(--orange)); display:flex; align-items:center; justify-content:center; font-family:'Bebas Neue',sans-serif; font-size:14px; color:#0d0b14; }
+  #user-name { font-family:'DM Mono',monospace; font-size:11px; color:var(--dim); }
+  #signout-btn { background:none; border:1px solid var(--border); border-radius:6px; padding:4px 10px; color:var(--faint); font-family:'DM Mono',monospace; font-size:10px; cursor:pointer; }
+  ::-webkit-scrollbar { display:none; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  @keyframes spin   { to{transform:rotate(360deg)} }
+</style>
+</head>
+<body>
+
+<div id="auth-screen" style="display:flex">
+  <div style="font-family:'Bebas Neue',sans-serif;font-size:42px;color:var(--gold);letter-spacing:.05em;line-height:1">Life<br>Dashboard</div>
+  <div style="font-family:'DM Mono',monospace;font-size:13px;color:var(--dim);text-align:center;max-width:260px">Sign in to sync your goals and fitness data across all your devices</div>
+  <button onclick="signInGoogle()" style="display:flex;align-items:center;gap:12px;background:var(--card);border:1px solid var(--border2);border-radius:14px;padding:14px 24px;color:var(--text);font-family:'DM Mono',monospace;font-size:14px;cursor:pointer;margin-top:8px">
+    <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+    Sign in with Google
+  </button>
+</div>
+
+<div id="app" style="display:none">
+  <div id="user-bar">
+    <div id="user-avatar">?</div>
+    <div id="user-name"></div>
+    <button id="signout-btn" onclick="signOutUser()">Sign out</button>
+  </div>
+  <div id="main-content"></div>
+  <div id="tab-bar">
+    <button class="tab-btn active" data-tab="home"     onclick="switchTab('home')">    <span>🏠</span>Home</button>
+    <button class="tab-btn"        data-tab="fitness"  onclick="switchTab('fitness')"> <span>🏋️</span>Fitness</button>
+    <button class="tab-btn"        data-tab="health"   onclick="switchTab('health')">  <span>💊</span>Health</button>
+    <button class="tab-btn"        data-tab="calendar" onclick="switchTab('calendar')"><span>📅</span>Calendar</button>
+  </div>
+</div>
+
+</body>
+</html>
