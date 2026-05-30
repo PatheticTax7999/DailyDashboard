@@ -11,17 +11,30 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Add system prompt as first message
-    const allMessages = [
-      {
-        role: 'user',
-        parts: [{ text: systemPrompt }]
-      },
-      ...messages.map(msg => ({
+    // Convert messages to Gemini format - include system prompt in first message
+    const geminiMessages = [];
+    
+    // Add system prompt as the first user message
+    geminiMessages.push({
+      role: 'user',
+      parts: [{ text: systemPrompt + '\n\n' }]
+    });
+
+    // Add actual conversation messages
+    messages.forEach(msg => {
+      geminiMessages.push({
         role: msg.role === 'user' ? 'user' : 'model',
         parts: [{ text: msg.content }]
-      }))
-    ];
+      });
+    });
+
+    const payload = {
+      contents: geminiMessages,
+      generationConfig: {
+        maxOutputTokens: 512,
+        temperature: 0.7,
+      }
+    };
 
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1p1beta1/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
@@ -30,43 +43,31 @@ export default async function handler(req, res) {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          contents: allMessages,
-          generationConfig: {
-            maxOutputTokens: 512,
-          }
-        }),
+        body: JSON.stringify(payload),
       }
     );
 
     const responseText = await response.text();
-    console.log('Gemini raw response:', responseText);
 
     if (!response.ok) {
-      console.error('Gemini error:', responseText);
+      console.error('Gemini API error:', responseText);
       return res.status(response.status).json({ 
-        error: responseText || 'API error' 
+        error: `Gemini API error: ${responseText}` 
       });
     }
 
-    let data;
-    try {
-      data = JSON.parse(responseText);
-    } catch (e) {
-      console.error('JSON parse error:', e);
-      return res.status(500).json({ error: 'Invalid response from Gemini API' });
-    }
+    const data = JSON.parse(responseText);
 
-    if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
+    if (!data.candidates || !data.candidates[0]?.content?.parts?.[0]?.text) {
       console.error('Unexpected response structure:', data);
-      return res.status(500).json({ error: 'Unexpected response structure from Gemini' });
+      return res.status(500).json({ error: 'No response from Gemini' });
     }
 
     const reply = data.candidates[0].content.parts[0].text;
     
     return res.status(200).json({ reply });
   } catch (error) {
-    console.error('Error:', error.message);
+    console.error('Coach endpoint error:', error);
     return res.status(500).json({ error: error.message });
   }
 }
