@@ -39,20 +39,34 @@ export default async function handler(req, res) {
       }
     );
 
+    const responseText = await response.text();
+    console.log('Gemini raw response:', responseText);
+
     if (!response.ok) {
-      const error = await response.json();
-      console.error('Gemini error:', error);
+      console.error('Gemini error:', responseText);
       return res.status(response.status).json({ 
-        error: error.error?.message || 'API error' 
+        error: responseText || 'API error' 
       });
     }
 
-    const data = await response.json();
+    let data;
+    try {
+      data = JSON.parse(responseText);
+    } catch (e) {
+      console.error('JSON parse error:', e);
+      return res.status(500).json({ error: 'Invalid response from Gemini API' });
+    }
+
+    if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
+      console.error('Unexpected response structure:', data);
+      return res.status(500).json({ error: 'Unexpected response structure from Gemini' });
+    }
+
     const reply = data.candidates[0].content.parts[0].text;
     
     return res.status(200).json({ reply });
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Error:', error.message);
     return res.status(500).json({ error: error.message });
   }
 }
