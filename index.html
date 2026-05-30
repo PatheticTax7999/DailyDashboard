@@ -1204,7 +1204,7 @@ When analysing progress photos, give honest, actionable feedback on physique, fo
     messages.push({role: "user", content: text});
 
     // Call your Vercel endpoint (now uses Gemini)
-    const response = await fetch('/api/coach', {
+    const response = await fetch('/api/coach.js', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
